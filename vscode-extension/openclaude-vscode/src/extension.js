@@ -1,4 +1,5 @@
 const vscode = require('vscode');
+const crypto = require('crypto');
 
 function launchOpenClaude() {
   const configured = vscode.workspace.getConfiguration('openclaude');
@@ -39,7 +40,7 @@ class OpenClaudeControlCenterProvider {
   }
 
   getHtml(webview) {
-    const nonce = String(Date.now());
+    const nonce = crypto.randomBytes(16).toString('base64');
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
