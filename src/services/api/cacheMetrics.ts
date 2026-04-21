@@ -68,9 +68,9 @@ export type CacheMetrics = {
    */
   created: number
   /**
-   * Total input tokens charged for this request (cached + fresh, by
-   * provider convention — see per-provider branches for specifics).
-   * Used as denominator for hit-rate when available.
+   * Total input tokens the request is measured against, computed uniformly
+   * as `fresh + read + created` after the shim normalizes every provider
+   * to the Anthropic convention. Used as the denominator for hit-rate.
    */
   total: number
   /**
