@@ -183,6 +183,59 @@ export function extractCacheReadFromRawUsage(usage: RawUsage): number {
 }
 
 /**
+ * Shape produced by the shim layer — matches the Anthropic BetaUsage
+ * fields that every downstream caller (cost-tracker, REPL, /cache-stats)
+ * consumes. Keeping it in this module lets the shim and the integration
+ * tests share one definition and eliminates the drift class of bugs
+ * where a shim is updated but a test simulator isn't.
+ */
+export type NormalizedShimUsage = {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_input_tokens: number
+  cache_read_input_tokens: number
+}
+
+/**
+ * Convert raw provider usage (any known shape) into the Anthropic-shape
+ * `NormalizedShimUsage` used throughout the codebase. Single source of
+ * truth for the shim layer — `codexShim.makeUsage`,
+ * `openaiShim.convertChunkUsage`, and the non-streaming response in
+ * `OpenAIShimMessages` all call this helper, and the integration test
+ * calls it directly instead of re-implementing the conversion.
+ *
+ * Design contract:
+ *   - `cache_read_input_tokens` comes from `extractCacheReadFromRawUsage`
+ *     (provider-aware extraction).
+ *   - `input_tokens` is rewritten to Anthropic convention: FRESH only,
+ *     with `cache_read` subtracted from the raw prompt count if the
+ *     provider included it there (OpenAI family does; Anthropic native
+ *     already excludes it).
+ *   - `cache_creation_input_tokens` is always 0 at the shim boundary —
+ *     only Anthropic native emits a non-zero creation count, and it
+ *     doesn't flow through these shims.
+ *   - Output token count accepts both `output_tokens` (Codex/Responses)
+ *     and `completion_tokens` (Chat Completions).
+ */
+export function buildAnthropicUsageFromRawUsage(
+  raw: RawUsage,
+): NormalizedShimUsage {
+  const cacheRead = extractCacheReadFromRawUsage(raw)
+  const u = (raw ?? {}) as Record<string, unknown>
+  const rawInput =
+    asNumber(u.input_tokens) || asNumber(u.prompt_tokens)
+  const fresh = rawInput >= cacheRead ? rawInput - cacheRead : rawInput
+  const output =
+    asNumber(u.output_tokens) || asNumber(u.completion_tokens)
+  return {
+    input_tokens: fresh,
+    output_tokens: output,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: cacheRead,
+  }
+}
+
+/**
  * Extract a unified CacheMetrics from POST-SHIM (Anthropic-shape) usage.
  *
  * By the time this runs, openaiShim/codexShim have already converted
