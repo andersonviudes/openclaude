@@ -342,6 +342,40 @@ export type NormalizedShimUsage = {
  *     doesn't flow through these shims.
  *   - Output token count accepts both `output_tokens` (Codex/Responses)
  *     and `completion_tokens` (Chat Completions).
+ *
+ * Observed raw shapes per provider (pinned so future drift is caught):
+ *   - OpenAI Chat Completions:
+ *       `{ prompt_tokens, completion_tokens,
+ *          prompt_tokens_details: { cached_tokens } }`
+ *       where `cached_tokens` is a SUBSET of `prompt_tokens` — hence
+ *       the subtraction below.
+ *   - OpenAI Codex / Responses API:
+ *       `{ input_tokens, output_tokens,
+ *          input_tokens_details: { cached_tokens } }`
+ *       same convention: cached is included in `input_tokens`.
+ *   - Anthropic native:
+ *       `{ input_tokens, output_tokens,
+ *          cache_read_input_tokens, cache_creation_input_tokens }`
+ *       cached is EXCLUDED from `input_tokens`. The subtraction here
+ *       no-ops (cache_read is read off a dedicated field, then fresh =
+ *       input_tokens - 0 = input_tokens) — safe passthrough.
+ *   - Kimi/Moonshot:
+ *       `{ prompt_tokens, completion_tokens, cached_tokens }` — top
+ *       level, not nested. OpenAI-family subset convention.
+ *   - DeepSeek:
+ *       `{ prompt_tokens, completion_tokens, prompt_cache_hit_tokens,
+ *          prompt_cache_miss_tokens }`. The `hit` field is the cached
+ *       count, also a subset of `prompt_tokens`.
+ *
+ * If a future provider deviates (ships cached tokens ALREADY excluded
+ * from input_tokens, Anthropic-style), this function will under-count
+ * their fresh-input by `cache_read`. The regression test
+ * `cacheMetricsIntegration.test.ts > "Codex makeUsage no longer
+ * double-bills"` pins the current Codex shape so a deviation breaks
+ * visibly. If you're adding a new provider, verify the shape and —
+ * if needed — extend `extractCacheReadFromRawUsage` to pick a field
+ * that represents cached-tokens-already-excluded (and skip the
+ * subtraction by setting `rawInput` to `prompt_tokens + cache_read`).
  */
 export function buildAnthropicUsageFromRawUsage(
   raw: RawUsage,
@@ -420,8 +454,16 @@ export function extractCacheMetrics(
  *   "[Cache: 1.2k read • hit 12%]"
  *   "[Cache: N/A]"                  (unsupported provider)
  *   "[Cache: cold]"                 (supported, no reads yet)
+ *
+ * The `undefined` branch at the top is defensive: TypeScript enforces
+ * `CacheMetrics` at call sites, but a failed API response could leave
+ * the caller with nothing to render. Treat absent metrics as "no data"
+ * rather than throwing on `metrics.supported`.
  */
-export function formatCacheMetricsCompact(metrics: CacheMetrics): string {
+export function formatCacheMetricsCompact(
+  metrics: CacheMetrics | undefined | null,
+): string {
+  if (!metrics) return '[Cache: N/A]'
   if (!metrics.supported) return '[Cache: N/A]'
   if (metrics.read === 0 && metrics.created === 0) return '[Cache: cold]'
   const parts: string[] = [`${formatCompactNumber(metrics.read)} read`]
@@ -437,8 +479,14 @@ export function formatCacheMetricsCompact(metrics: CacheMetrics): string {
  *
  * Example:
  *   "[Cache: read=1.2k created=340 hit=12%]"
+ *
+ * Same `undefined` tolerance as `formatCacheMetricsCompact` — a failed
+ * API response shouldn't throw on the display path.
  */
-export function formatCacheMetricsFull(metrics: CacheMetrics): string {
+export function formatCacheMetricsFull(
+  metrics: CacheMetrics | undefined | null,
+): string {
+  if (!metrics) return '[Cache: N/A]'
   if (!metrics.supported) return '[Cache: N/A]'
   const parts: string[] = [
     `read=${formatCompactNumber(metrics.read)}`,

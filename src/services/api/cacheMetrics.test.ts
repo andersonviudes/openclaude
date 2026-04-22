@@ -498,6 +498,25 @@ describe('extractCacheMetrics — self-hosted bucket', () => {
   })
 })
 
+describe('formatCacheMetrics — defensive null/undefined guards', () => {
+  test('formatCacheMetricsCompact returns N/A for undefined input', () => {
+    // Signature says `CacheMetrics` but runtime bug on a failed API
+    // response could leave the caller with nothing. The formatter
+    // should degrade gracefully rather than throw on `.supported`.
+    expect(formatCacheMetricsCompact(undefined)).toBe('[Cache: N/A]')
+    expect(formatCacheMetricsCompact(null as unknown as undefined)).toBe(
+      '[Cache: N/A]',
+    )
+  })
+
+  test('formatCacheMetricsFull returns N/A for undefined input', () => {
+    expect(formatCacheMetricsFull(undefined)).toBe('[Cache: N/A]')
+    expect(formatCacheMetricsFull(null as unknown as undefined)).toBe(
+      '[Cache: N/A]',
+    )
+  })
+})
+
 describe('formatCacheMetricsCompact — self-hosted renders as N/A', () => {
   test('same surface as other unsupported providers', () => {
     const metrics = extractCacheMetrics(
