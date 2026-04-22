@@ -164,12 +164,18 @@ function isLocalOrPrivateUrl(url: string): boolean {
   const h = hostname.startsWith('[') && hostname.endsWith(']')
     ? hostname.slice(1, -1)
     : hostname
-  // Literal localhost alias.
-  if (h === 'localhost') return true
-  // Reserved TLDs per RFC 6761, RFC 6762 (mDNS), RFC 8375 (home network).
-  // These are guaranteed never to resolve to public infrastructure.
+  // Reserved TLDs and `localhost` itself — all guaranteed never to
+  // resolve to public infrastructure. Sources:
+  //   - RFC 6761 §6.3  — `.localhost` (Chrome/Firefox/systemd-resolved
+  //                       resolve `*.localhost` to 127.0.0.1 natively)
+  //   - RFC 6762        — `.local` mDNS (Bonjour)
+  //   - RFC 8375        — `.home.arpa` (residential home networks)
+  //   - de facto        — `.lan`, `.internal`, `.intranet` (widely used
+  //                       in corporate DNS despite not being formally
+  //                       reserved)
   if (
-    h === 'local' ||
+    h === 'localhost' ||
+    h.endsWith('.localhost') ||
     h.endsWith('.local') ||
     h.endsWith('.lan') ||
     h.endsWith('.internal') ||
@@ -395,7 +401,13 @@ export function extractCacheMetrics(
     read,
     created,
     total,
-    hitRate: total > 0 ? read / total : null,
+    // Clamp to [0, 1]. With non-negative inputs the math guarantees
+    // `read <= total` — but an upstream shim bug (e.g. future provider
+    // where we accidentally read a negative `fresh`) could violate the
+    // invariant. Showing a pinned `1.0` on anomalous input is clearer
+    // than a nonsense ratio > 100% and safer than `null` (which would
+    // hide the issue completely).
+    hitRate: total > 0 ? Math.min(1, read / total) : null,
     supported: true,
   }
 }

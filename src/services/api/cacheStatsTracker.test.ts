@@ -104,6 +104,89 @@ describe('cacheStatsTracker — history', () => {
   })
 })
 
+describe('cacheStatsTracker — ring buffer semantics', () => {
+  test('ring wraps at cap without shifting (chronological order preserved)', () => {
+    _setHistoryCapForTesting(4)
+    // Push exactly 2×cap entries — forces one full wrap.
+    for (let i = 0; i < 8; i++) {
+      recordRequest(makeMetrics({ read: i, total: 10 }), `m${i}`)
+    }
+    const history = getCacheStatsHistory()
+    expect(history.length).toBe(4)
+    // After 8 pushes with cap=4, the survivors must be the newest 4 —
+    // m4, m5, m6, m7 — in chronological order. If the ring logic were
+    // wrong (e.g. off-by-one on writeIdx) this would come out rotated.
+    expect(history.map((h) => h.label)).toEqual(['m4', 'm5', 'm6', 'm7'])
+  })
+
+  test('read before ring wraps returns partial history in order', () => {
+    _setHistoryCapForTesting(10)
+    for (let i = 0; i < 3; i++) {
+      recordRequest(makeMetrics({ read: i, total: 10 }), `m${i}`)
+    }
+    const history = getCacheStatsHistory()
+    expect(history.map((h) => h.label)).toEqual(['m0', 'm1', 'm2'])
+  })
+
+  test('shrinking cap preserves the newest entries in order', () => {
+    _setHistoryCapForTesting(5)
+    for (let i = 0; i < 5; i++) {
+      recordRequest(makeMetrics({ read: i, total: 10 }), `m${i}`)
+    }
+    _setHistoryCapForTesting(3)
+    const history = getCacheStatsHistory()
+    expect(history.map((h) => h.label)).toEqual(['m2', 'm3', 'm4'])
+    // And pushing after shrink still respects the new cap.
+    recordRequest(makeMetrics({ read: 5, total: 10 }), 'm5')
+    expect(getCacheStatsHistory().map((h) => h.label)).toEqual(['m3', 'm4', 'm5'])
+  })
+
+  test('growing cap preserves existing entries and accepts more', () => {
+    _setHistoryCapForTesting(3)
+    for (let i = 0; i < 3; i++) {
+      recordRequest(makeMetrics({ read: i, total: 10 }), `m${i}`)
+    }
+    _setHistoryCapForTesting(6)
+    // After growing, the existing three should still be there in order,
+    // and we should be able to push three more before eviction starts.
+    for (let i = 3; i < 6; i++) {
+      recordRequest(makeMetrics({ read: i, total: 10 }), `m${i}`)
+    }
+    const history = getCacheStatsHistory()
+    expect(history.map((h) => h.label)).toEqual([
+      'm0',
+      'm1',
+      'm2',
+      'm3',
+      'm4',
+      'm5',
+    ])
+  })
+
+  test('_setHistoryCapForTesting throws on non-positive cap', () => {
+    // A zero cap would divide-by-zero on the ring write index and
+    // silently corrupt the buffer. Loud failure > NaN indices.
+    expect(() => _setHistoryCapForTesting(0)).toThrow(/cap must be >= 1/)
+    expect(() => _setHistoryCapForTesting(-3)).toThrow(/cap must be >= 1/)
+  })
+
+  test('resetSessionCacheStats empties the ring even when wrapped', () => {
+    _setHistoryCapForTesting(3)
+    for (let i = 0; i < 10; i++) {
+      recordRequest(makeMetrics({ read: i, total: 10 }), `m${i}`)
+    }
+    // Sanity: ring has wrapped many times.
+    expect(getCacheStatsHistory().length).toBe(3)
+    resetSessionCacheStats()
+    expect(getCacheStatsHistory()).toEqual([])
+    // And a fresh push after reset starts from index 0 again.
+    recordRequest(makeMetrics({ read: 99, total: 100 }), 'post-reset')
+    const after = getCacheStatsHistory()
+    expect(after.length).toBe(1)
+    expect(after[0]!.label).toBe('post-reset')
+  })
+})
+
 describe('cacheStatsTracker — unsupported mixing', () => {
   test('mixing supported + unsupported keeps supported data visible', () => {
     recordRequest(

@@ -408,6 +408,81 @@ describe('resolveCacheProvider', () => {
   })
 })
 
+describe('resolveCacheProvider — .localhost TLD (RFC 6761)', () => {
+  test('subdomains of .localhost classify as self-hosted', () => {
+    // Chrome, Firefox, and systemd-resolved all natively resolve
+    // *.localhost to 127.0.0.1. Kubernetes Ingress and docker-compose
+    // setups commonly use app.localhost, api.localhost, etc.
+    expect(
+      resolveCacheProvider('openai', {
+        openAiBaseUrl: 'http://app.localhost:3000/v1',
+      }),
+    ).toBe('self-hosted')
+    expect(
+      resolveCacheProvider('openai', {
+        openAiBaseUrl: 'http://api.localhost/v1',
+      }),
+    ).toBe('self-hosted')
+    expect(
+      resolveCacheProvider('openai', {
+        openAiBaseUrl: 'http://llm.dev.localhost:8080/v1',
+      }),
+    ).toBe('self-hosted')
+  })
+
+  test('.localhost TLD does NOT match substring collisions', () => {
+    // Guard against regressions where `localhost` would match via
+    // substring rather than TLD semantics. `localhostify.com` and
+    // `mylocalhost.net` must stay on the public `openai` path.
+    expect(
+      resolveCacheProvider('openai', {
+        openAiBaseUrl: 'https://localhostify.com/v1',
+      }),
+    ).toBe('openai')
+    expect(
+      resolveCacheProvider('openai', {
+        openAiBaseUrl: 'https://mylocalhost.net/v1',
+      }),
+    ).toBe('openai')
+  })
+})
+
+describe('extractCacheMetrics — hit rate clamp', () => {
+  test('hitRate is clamped to 1.0 on pathological input (read > total)', () => {
+    // Defensive guard: with valid non-negative inputs the math enforces
+    // read <= total, so hitRate cannot exceed 1. But an upstream shim
+    // bug (e.g. reading a negative `fresh` from a future provider) could
+    // break the invariant. `Math.min(1, read/total)` caps the display at
+    // 100% rather than letting a `read=800 total=500` case render as
+    // "hit 160%" or (worse) null, which would hide the anomaly.
+    const metrics = extractCacheMetrics(
+      {
+        cache_read_input_tokens: 800,
+        cache_creation_input_tokens: 0,
+        // asNumber keeps finite negatives, so fresh = -500 → total =
+        // 800 + 0 + (-500) = 300, read=800 → raw ratio 2.67, clamp to 1.
+        input_tokens: -500,
+      } as unknown as Record<string, unknown>,
+      'anthropic',
+    )
+    expect(metrics.supported).toBe(true)
+    expect(metrics.hitRate).toBe(1)
+  })
+
+  test('normal inputs still yield accurate fractional hit rates', () => {
+    // Regression: clamp must not perturb the happy path.
+    const metrics = extractCacheMetrics(
+      {
+        cache_read_input_tokens: 300,
+        cache_creation_input_tokens: 0,
+        input_tokens: 700,
+      },
+      'anthropic',
+    )
+    expect(metrics.hitRate).toBeCloseTo(0.3, 5)
+  })
+})
+
 describe('extractCacheMetrics — self-hosted bucket', () => {
   test('self-hosted provider is honestly unsupported (pre-fix: would show "[Cache: cold]")', () => {
     // Same contract as ollama / copilot-vanilla: supported=false so the
