@@ -30,7 +30,7 @@
 
 import { logEvent } from '../services/analytics/index.js'
 import { isEnvDefinedFalsy, isEnvTruthy } from './envUtils.js'
-import { fnv1a32 } from './stableStringify.js'
+import { djb2Hash } from './hash.js'
 
 export type ClaudeMdDelta = {
   /**
@@ -91,7 +91,11 @@ export function getClaudeMdDelta(
   }
 
   const normalized = currentContent ?? ''
-  const currentHash = normalized.length === 0 ? '' : fnv1a32(normalized)
+  // WHY: djb2Hash is the project-standard content hash for drift
+  // detection (same helper used by promptCacheBreakDetection.ts for
+  // cache-bust detection). toString(36) gives a compact short string.
+  const currentHash =
+    normalized.length === 0 ? '' : djb2Hash(normalized).toString(36)
 
   // True no-op: nothing to announce, nothing was ever announced.
   if (lastHash === null && currentHash === '') return null

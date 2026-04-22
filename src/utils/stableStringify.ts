@@ -20,8 +20,17 @@
  * (element order IS semantically significant in message/content arrays).
  *
  * Complements `sortKeysDeep` in src/services/remoteManagedSettings and
- * src/services/policyLimits — those are settings-specific; this one is
- * for the API request body.
+ * src/services/policyLimits. Those two are INTENTIONALLY separate:
+ *   - remoteManagedSettings: matches Python `json.dumps(sort_keys=True)`
+ *     byte-for-byte to validate server-computed checksums. Must NOT
+ *     drop undefined (Python preserves null).
+ *   - policyLimits: uses `localeCompare` (keeps legacy behavior; locale-
+ *     sensitive but stable for a given runtime).
+ *   - this module (stableStringify): byte-identity for API body caching.
+ *     Drops undefined to match `JSON.stringify` — the openaiShim/codexShim
+ *     body is always downstream of `JSON.stringify` semantics.
+ * Do not consolidate without auditing the 3 callers — each has a
+ * different server-compat contract.
  */
 
 /**
@@ -71,20 +80,3 @@ function sortingReplacer(_key: string, val: unknown): unknown {
   return sorted
 }
 
-/**
- * Simple fast non-cryptographic 32-bit hash. Used to detect content
- * drift in attachment delta scanners where the full content is stored
- * elsewhere and we only need to answer "has this changed?".
- *
- * FNV-1a 32-bit. Good enough for collision probabilities at our scale
- * (a few hundred attachments per session); avoids pulling in `crypto`
- * on the hot path.
- */
-export function fnv1a32(input: string): string {
-  let hash = 0x811c9dc5
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i)
-    hash = Math.imul(hash, 0x01000193) >>> 0
-  }
-  return hash.toString(16).padStart(8, '0')
-}

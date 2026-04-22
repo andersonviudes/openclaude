@@ -19,13 +19,15 @@
  * compare with current {path → content} → emit {addedNames,
  * addedContent, removedNames}.
  *
- * Hash is content-based (fnv1a32) — cheap and collision-free enough at
- * session scale. A path that disappears from the current set is a
- * retraction (file no longer in the resolved nested-memory rules).
+ * Hash is content-based (djb2Hash — project-standard drift hash; same
+ * helper used by promptCacheBreakDetection.ts) — cheap and collision-
+ * free enough at session scale. A path that disappears from the current
+ * set is a retraction (file no longer in the resolved nested-memory
+ * rules).
  */
 
 import { logEvent } from '../services/analytics/index.js'
-import { fnv1a32 } from './stableStringify.js'
+import { djb2Hash } from './hash.js'
 
 export type MemoryDelta = {
   /** Paths newly announced OR whose content changed since last turn. */
@@ -97,7 +99,7 @@ export function getMemoryDelta(
   const currentHashes = new Map<string, string>()
   for (const f of current) {
     currentMap.set(f.path, f.content)
-    currentHashes.set(f.path, fnv1a32(f.content))
+    currentHashes.set(f.path, djb2Hash(f.content).toString(36))
   }
 
   const added: Array<{ name: string; content: string; hash: string }> = []

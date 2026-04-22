@@ -1,9 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import {
-  fnv1a32,
-  sortKeysDeep,
-  stableStringify,
-} from './stableStringify.js'
+import { sortKeysDeep, stableStringify } from './stableStringify.js'
 
 // These tests pin byte-level stability of serialization helpers. The
 // invariant that matters for implicit prefix caching in OpenAI / Kimi /
@@ -79,21 +75,6 @@ describe('sortKeysDeep', () => {
     ]) as Array<Record<string, unknown>>
     expect(Object.keys(sorted[0]!)).toEqual(['a', 'b'])
     expect(Object.keys(sorted[1]!)).toEqual(['c', 'd'])
-  })
-})
-
-describe('fnv1a32', () => {
-  test('deterministic across calls', () => {
-    expect(fnv1a32('hello world')).toBe(fnv1a32('hello world'))
-  })
-
-  test('different inputs produce different outputs', () => {
-    expect(fnv1a32('a')).not.toBe(fnv1a32('b'))
-  })
-
-  test('always emits 8 hex chars', () => {
-    expect(fnv1a32('').length).toBe(8)
-    expect(fnv1a32('a'.repeat(10_000))).toMatch(/^[0-9a-f]{8}$/)
   })
 })
 

@@ -29,7 +29,9 @@ describe('getClaudeMdDelta', () => {
     expect(delta).not.toBeNull()
     expect(delta!.addedContent).toBe('# Project rules\nUse bun.')
     expect(delta!.isInitial).toBe(true)
-    expect(delta!.contentHash).toHaveLength(8)
+    // Hash is opaque — we only care it's non-empty and deterministic.
+    // Specific length depends on djb2Hash base36 encoding (varies by input).
+    expect(delta!.contentHash.length).toBeGreaterThan(0)
   })
 
   test('returns null when content matches the last announced hash', () => {
