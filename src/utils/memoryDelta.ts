@@ -118,8 +118,11 @@ export function getMemoryDelta(
 
   if (added.length === 0 && removed.length === 0) return null
 
-  // Deterministic output — announce order must be stable across runs
-  // to preserve byte-identical prefixes for implicit prefix caching.
+  // Deterministic output — announce order is stable within a given
+  // runtime locale. Matches the `localeCompare` convention used by
+  // mcpInstructionsDelta; sufficient for ASCII-range paths which are
+  // the common case. Strict byte-identity across heterogeneous locales
+  // is not guaranteed by localeCompare and not required here.
   added.sort((a, b) => a.name.localeCompare(b.name))
   removed.sort()
 
@@ -136,6 +139,9 @@ export function getMemoryDelta(
     addedContent: added.map(a => a.content),
     addedHashes: added.map(a => a.hash),
     removedNames: removed,
-    isInitial: announced.size === 0,
+    // mdCount, not announced.size: a prior delta that removed everything
+    // leaves announced empty but is NOT the initial announcement. Using
+    // mdCount avoids a false "isInitial: true" after a full retraction.
+    isInitial: mdCount === 0,
   }
 }

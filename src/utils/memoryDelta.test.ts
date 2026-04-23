@@ -149,4 +149,35 @@ describe('getMemoryDelta', () => {
     )!
     expect(a.addedNames).toEqual(['/a/CLAUDE.md', '/z/CLAUDE.md'])
   })
+
+  // Regression guard: `isInitial` must reflect "never announced before",
+  // not "currently-tracked set is empty". After a full retraction the
+  // tracked set goes to 0 but the session has already seen deltas; a
+  // subsequent re-add is NOT initial. Using announced.size here would
+  // silently lie on analytics.
+  test('isInitial stays false after a full retraction followed by re-add', () => {
+    const file = { path: '/pkg/CLAUDE.md', content: 'original' }
+
+    // Turn 1 — initial emit
+    const first = getMemoryDelta([file], [])!
+    expect(first.isInitial).toBe(true)
+
+    // Turn 2 — remove everything
+    const history: FakeMsg[] = [
+      priorDelta(first.addedNames, first.addedHashes),
+    ]
+    const retracted = getMemoryDelta([], history)!
+    expect(retracted.removedNames).toEqual(['/pkg/CLAUDE.md'])
+    expect(retracted.isInitial).toBe(false) // prior delta existed
+
+    // Turn 3 — re-add the same file after retraction. announced.size == 0
+    // at this point, but the session has already emitted 2 memory_delta
+    // attachments, so this is NOT initial.
+    history.push(
+      priorDelta([], [], retracted.removedNames),
+    )
+    const readded = getMemoryDelta([file], history)!
+    expect(readded.addedNames).toEqual(['/pkg/CLAUDE.md'])
+    expect(readded.isInitial).toBe(false)
+  })
 })
