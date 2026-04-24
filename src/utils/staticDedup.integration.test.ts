@@ -25,6 +25,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { estimateWithBounds } from '../services/tokenEstimation.js'
+import { appendSystemContext, prependUserContext } from './api.js'
 import {
   getClaudeMdDelta,
   isStaticDedupEnabled,
@@ -628,6 +629,155 @@ describe('static-dedup integration: env-toggled end-to-end savings', () => {
     // eslint-disable-next-line no-console
     console.log(
       `[static-dedup measured] bytes: baseline=${baseline.totalBytes} dedup=${dedup.totalBytes} savings=${(byteSavings * 100).toFixed(1)}% | tokens: baseline=${baseline.totalTokens} dedup=${dedup.totalTokens} savings=${(tokenSavings * 100).toFixed(1)}%`,
+    )
+  })
+})
+
+/**
+ * Real production pipeline: call the exact `appendSystemContext` and
+ * `prependUserContext` functions used by `src/services/api/claude.ts`
+ * before every request, toggle the env var, and compare bytes on the
+ * wire.
+ *
+ * This is the most honest end-to-end check we can run without booting
+ * a real session: the production code decides what to strip/keep based
+ * on `isStaticDedupEnabled()`, and we measure the serialized output.
+ * If `filterStaticDedupKeys` regresses, this test fails.
+ *
+ * `prependUserContext` early-returns when NODE_ENV === 'test' (a guard
+ * that prevents noisy test output); we override it so the production
+ * path actually runs during this block and restore it on teardown.
+ */
+describe('static-dedup integration: production injection functions', () => {
+  const ENV_VAR = 'OPENCLAUDE_STATIC_DEDUP'
+  // Minimal SystemPrompt-branded empty array for calling
+  // appendSystemContext. Matches the shape of production callers in
+  // src/services/api/claude.ts when the dynamic-boundary split yields
+  // an empty prefix half.
+  const EMPTY_SYSTEM_PROMPT = [] as unknown as Parameters<
+    typeof appendSystemContext
+  >[0]
+  let originalEnvValue: string | undefined
+  let originalNodeEnv: string | undefined
+
+  beforeAll(() => {
+    originalEnvValue = process.env[ENV_VAR]
+    originalNodeEnv = process.env.NODE_ENV
+    process.env.NODE_ENV = 'production'
+  })
+
+  afterAll(() => {
+    if (originalEnvValue === undefined) {
+      delete process.env[ENV_VAR]
+    } else {
+      process.env[ENV_VAR] = originalEnvValue
+    }
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV
+    } else {
+      process.env.NODE_ENV = originalNodeEnv
+    }
+  })
+
+  function buildFixtureContext(): Record<string, string> {
+    return {
+      claudeMd: repeat(TYPICAL_CLAUDE_MD_SIZE),
+      gitStatus: repeat(TYPICAL_GIT_STATUS_SIZE),
+      directoryStructure: 'src/\n  utils/\n  services/\n', // sample non-static
+      platform: 'linux',
+    }
+  }
+
+  test('appendSystemContext keeps claudeMd/gitStatus when flag OFF', () => {
+    process.env[ENV_VAR] = ''
+    expect(isStaticDedupEnabled()).toBe(false)
+    const output = appendSystemContext(EMPTY_SYSTEM_PROMPT, buildFixtureContext())
+    const joined = output.join('\n')
+    expect(joined).toContain('claudeMd:')
+    expect(joined).toContain('gitStatus:')
+    expect(joined.length).toBeGreaterThan(TYPICAL_CLAUDE_MD_SIZE)
+  })
+
+  test('appendSystemContext strips claudeMd/gitStatus when flag ON', () => {
+    process.env[ENV_VAR] = 'true'
+    expect(isStaticDedupEnabled()).toBe(true)
+    const output = appendSystemContext(EMPTY_SYSTEM_PROMPT, buildFixtureContext())
+    const joined = output.join('\n')
+    expect(joined).not.toContain('claudeMd:')
+    expect(joined).not.toContain('gitStatus:')
+    // Non-static keys still flow through.
+    expect(joined).toContain('directoryStructure:')
+    expect(joined).toContain('platform:')
+    // Payload is smaller by at least the sum of the stripped bodies.
+    expect(joined.length).toBeLessThan(
+      TYPICAL_CLAUDE_MD_SIZE + TYPICAL_GIT_STATUS_SIZE,
+    )
+  })
+
+  test('prependUserContext injects claudeMd/gitStatus when flag OFF', () => {
+    process.env[ENV_VAR] = ''
+    const output = prependUserContext([], buildFixtureContext())
+    expect(output.length).toBe(1) // the injected system-reminder
+    const injected = stableStringify(output[0])
+    expect(injected).toContain('claudeMd')
+    expect(injected).toContain('gitStatus')
+  })
+
+  test('prependUserContext omits claudeMd/gitStatus when flag ON', () => {
+    process.env[ENV_VAR] = 'true'
+    const output = prependUserContext([], buildFixtureContext())
+    // With claudeMd + gitStatus stripped, remaining context keys
+    // (directoryStructure, platform) should still trigger injection.
+    expect(output.length).toBe(1)
+    const injected = stableStringify(output[0])
+    expect(injected).not.toContain('claudeMd')
+    expect(injected).not.toContain('gitStatus')
+    expect(injected).toContain('directoryStructure')
+  })
+
+  test('prependUserContext skips injection entirely if only dedup keys present', () => {
+    // Edge case: the only context keys are the ones that get stripped.
+    // With flag ON the filtered context is empty → no system-reminder.
+    process.env[ENV_VAR] = 'true'
+    const output = prependUserContext([], {
+      claudeMd: 'some content',
+      gitStatus: 'M file.ts',
+    })
+    expect(output.length).toBe(0)
+  })
+
+  test('measured savings via the real injection pipeline (10-turn session)', () => {
+    // Per-turn: appendSystemContext + prependUserContext combined is
+    // what the request body actually carries as "context shell" before
+    // the conversation history. Measure both shapes and compare.
+    function measureContextPayload(): { bytes: number; tokens: number } {
+      const context = buildFixtureContext()
+      const systemOut = appendSystemContext(EMPTY_SYSTEM_PROMPT, context)
+      const userOut = prependUserContext([], context)
+      const combined = stableStringify({ systemOut, userOut })
+      return {
+        bytes: combined.length,
+        tokens: estimateWithBounds(combined, 'json').estimate,
+      }
+    }
+
+    process.env[ENV_VAR] = ''
+    const baseline = measureContextPayload()
+    process.env[ENV_VAR] = 'true'
+    const dedup = measureContextPayload()
+
+    const byteSavings = (baseline.bytes - dedup.bytes) / baseline.bytes
+    const tokenSavings = (baseline.tokens - dedup.tokens) / baseline.tokens
+
+    // The context shell shrinks drastically when the flag is on: both
+    // appendSystemContext and prependUserContext strip the same keys,
+    // so savings should exceed the 25% floor comfortably.
+    expect(byteSavings).toBeGreaterThanOrEqual(MIN_SAVINGS_RATIO)
+    expect(tokenSavings).toBeGreaterThanOrEqual(MIN_SAVINGS_RATIO)
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[static-dedup pipeline] bytes: baseline=${baseline.bytes} dedup=${dedup.bytes} savings=${(byteSavings * 100).toFixed(1)}% | tokens: baseline=${baseline.tokens} dedup=${dedup.tokens} savings=${(tokenSavings * 100).toFixed(1)}%`,
     )
   })
 })
