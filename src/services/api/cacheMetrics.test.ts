@@ -483,10 +483,11 @@ describe('extractCacheMetrics — hit rate clamp', () => {
   })
 })
 
-describe('extractCacheMetrics — self-hosted bucket', () => {
-  test('self-hosted provider is honestly unsupported (pre-fix: would show "[Cache: cold]")', () => {
-    // Same contract as ollama / copilot-vanilla: supported=false so the
-    // display surfaces '[Cache: N/A]' instead of fabricating a hit rate.
+describe('extractCacheMetrics — self-hosted bucket (data-driven)', () => {
+  test('vanilla self-hosted endpoint without cache fields → unsupported / N/A', () => {
+    // vLLM, LocalAI, text-generation-webui, etc. emit no cache fields
+    // at all. With read=created=0 we mark unsupported so the REPL shows
+    // honest '[Cache: N/A]' instead of a fabricated 0%.
     const metrics = extractCacheMetrics(
       { input_tokens: 1_000, output_tokens: 200 },
       'self-hosted',
@@ -495,6 +496,42 @@ describe('extractCacheMetrics — self-hosted bucket', () => {
     expect(metrics.hitRate).toBeNull()
     expect(metrics.read).toBe(0)
     expect(metrics.created).toBe(0)
+  })
+
+  test('internal reverse proxy forwarding real cache data → supported', () => {
+    // Review-blocker regression guard: an enterprise setup with an
+    // internal proxy on a private URL (e.g. `http://llm.internal:5000/v1`)
+    // forwarding to OpenAI / Kimi / DeepSeek / Gemini WILL deliver real
+    // cache fields via the shim. Pre-fix we would discard them because
+    // the URL heuristic classified the endpoint as 'self-hosted'. Now
+    // the data itself decides: any non-zero cache activity flows through
+    // the same normalization as an OpenAI bucket.
+    const shimmed = {
+      input_tokens: 800, // fresh (post-shim, cached already subtracted)
+      cache_read_input_tokens: 1_200, // shim extracted from upstream
+      cache_creation_input_tokens: 0,
+    }
+    const metrics = extractCacheMetrics(shimmed, 'self-hosted')
+    expect(metrics.supported).toBe(true)
+    expect(metrics.read).toBe(1_200)
+    expect(metrics.total).toBe(2_000)
+    expect(metrics.hitRate).toBe(0.6)
+  })
+
+  test('proxy with cache_creation but zero cache_read → still supported', () => {
+    // Mirror of the above for the first-call / cold-cache scenario:
+    // Anthropic-compatible upstreams emit creation tokens on the first
+    // request that primes the cache. Self-hosted proxy must preserve
+    // that signal, not swallow it because read is still 0.
+    const shimmed = {
+      input_tokens: 500,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 800,
+    }
+    const metrics = extractCacheMetrics(shimmed, 'self-hosted')
+    expect(metrics.supported).toBe(true)
+    expect(metrics.created).toBe(800)
+    expect(metrics.read).toBe(0)
   })
 })
 
@@ -517,14 +554,32 @@ describe('formatCacheMetrics — defensive null/undefined guards', () => {
   })
 })
 
-describe('formatCacheMetricsCompact — self-hosted renders as N/A', () => {
-  test('same surface as other unsupported providers', () => {
+describe('formatCacheMetricsCompact — self-hosted display paths', () => {
+  test('vanilla self-hosted (no cache data) renders as N/A', () => {
     const metrics = extractCacheMetrics(
       { input_tokens: 500 },
       'self-hosted',
     )
     expect(formatCacheMetricsCompact(metrics)).toBe('[Cache: N/A]')
     expect(formatCacheMetricsFull(metrics)).toBe('[Cache: N/A]')
+  })
+
+  test('self-hosted proxy with forwarded cache data renders real metrics', () => {
+    // Full display-path regression guard for the review-blocker fix:
+    // the user must see the real hit rate that the upstream emitted,
+    // not a silent N/A because the URL looked private.
+    const metrics = extractCacheMetrics(
+      {
+        input_tokens: 800,
+        cache_read_input_tokens: 1_200,
+        cache_creation_input_tokens: 0,
+      },
+      'self-hosted',
+    )
+    expect(formatCacheMetricsCompact(metrics)).toBe('[Cache: 1.2k read • hit 60%]')
+    expect(formatCacheMetricsFull(metrics)).toBe(
+      '[Cache: read=1.2k created=0 hit=60%]',
+    )
   })
 })
 

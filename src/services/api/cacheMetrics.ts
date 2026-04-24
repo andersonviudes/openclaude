@@ -411,22 +411,31 @@ export function extractCacheMetrics(
   provider: CacheAwareProvider,
 ): CacheMetrics {
   if (!usage || typeof usage !== 'object') return UNSUPPORTED
-  // Copilot vanilla (no Claude) and Ollama don't expose cache fields at
-  // all. Returning supported:false lets the REPL print "N/A" instead of
-  // lying with 0%. Every other provider has been normalized to the
-  // Anthropic shape by the shim, so we read uniformly below.
-  if (
-    provider === 'copilot' ||
-    provider === 'ollama' ||
-    provider === 'self-hosted'
-  ) {
-    return UNSUPPORTED
-  }
-
   const u = usage as Record<string, unknown>
   const read = asNumber(u.cache_read_input_tokens)
   const created = asNumber(u.cache_creation_input_tokens)
   const fresh = asNumber(u.input_tokens)
+  // Copilot vanilla (no Claude) and Ollama don't expose cache fields at
+  // all as a provider-identity matter. These are explicit provider
+  // selections (via CLAUDE_CODE_USE_GITHUB and the Ollama base-URL
+  // default port), so we can hard-wire `supported: false` and let the
+  // REPL print "N/A" instead of a fabricated 0%.
+  if (provider === 'copilot' || provider === 'ollama') {
+    return UNSUPPORTED
+  }
+  // `self-hosted` is different: the bucket is inferred from the base
+  // URL being on a private network (RFC1918, .local TLD, etc.), which
+  // is a heuristic, not an authoritative "this endpoint cannot cache"
+  // signal. An internal reverse proxy forwarding to OpenAI / Kimi /
+  // DeepSeek / Gemini will produce a private URL but ALSO emit real
+  // cache fields via the shim. Force-unsupported here would discard
+  // legitimate data. Let the data decide: if the shim extracted any
+  // cache activity (read OR created), trust it and fall through to
+  // normal extraction; otherwise render honest N/A for vanilla
+  // vLLM/LocalAI-style endpoints that really don't cache.
+  if (provider === 'self-hosted' && read === 0 && created === 0) {
+    return UNSUPPORTED
+  }
   // total = fresh + read + created — shim already stripped `read` out of
   // `fresh` so the three components don't double-count. This matches the
   // Anthropic convention even when the upstream was OpenAI/Kimi/DeepSeek.

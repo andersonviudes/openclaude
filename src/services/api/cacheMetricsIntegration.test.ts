@@ -257,6 +257,37 @@ describe('display path end-to-end — private-IP, custom-port, self-hosted endpo
     })
     expect(bucket).toBe('self-hosted')
   })
+
+  test('self-hosted proxy forwarding real upstream cache data is NOT discarded', () => {
+    // Review-blocker regression: an enterprise setup with an internal
+    // reverse proxy on a private URL forwarding to OpenAI / Kimi /
+    // DeepSeek / Gemini WILL deliver real cache fields via the shim.
+    // Pre-fix, the URL heuristic → self-hosted → unconditional
+    // `supported: false` discarded the data and rendered '[Cache: N/A]'
+    // even though valid cache metrics were on the payload. Post-fix,
+    // the data decides: non-zero cache activity trumps the URL bucket.
+    const bucket = resolveCacheProvider('openai', {
+      openAiBaseUrl: 'http://llm-proxy.corp.internal:5000/v1',
+    })
+    expect(bucket).toBe('self-hosted')
+
+    // Typical raw Kimi shape (the reverse proxy forwards this through
+    // unchanged). Shim normalizes to Anthropic shape.
+    const raw = { prompt_tokens: 2_000, cached_tokens: 800 }
+    const shimmed = buildAnthropicUsageFromRawUsage(raw)
+
+    // Display path with the fix: data is preserved end-to-end.
+    const metrics = extractCacheMetrics(
+      shimmed as unknown as Record<string, unknown>,
+      bucket,
+    )
+    expect(metrics.supported).toBe(true)
+    expect(metrics.read).toBe(800)
+    expect(metrics.hitRate).toBe(0.4)
+    expect(formatCacheMetricsCompact(metrics)).toBe(
+      '[Cache: 800 read • hit 40%]',
+    )
+  })
 })
 
 describe('regression guards — bug reproducers', () => {
