@@ -320,6 +320,24 @@ export function Config({
       });
     }
   }, {
+    id: 'toolResultSummarizerEnabled',
+    label: 'Tool result summarizer',
+    value: globalConfig.toolResultSummarizerEnabled,
+    type: 'boolean' as const,
+    onChange(toolResultSummarizerEnabled: boolean) {
+      saveGlobalConfig(current => ({
+        ...current,
+        toolResultSummarizerEnabled
+      }));
+      setGlobalConfig({
+        ...getGlobalConfig(),
+        toolResultSummarizerEnabled
+      });
+      logEvent('openclaude_tool_result_summarizer_setting_changed', {
+        enabled: toolResultSummarizerEnabled
+      });
+    }
+  }, {
     id: 'spinnerTipsEnabled',
     label: 'Show tips',
     value: settingsData?.spinnerTipsEnabled ?? true,
@@ -1198,6 +1216,9 @@ export function Config({
     }
     if (globalConfig.toolHistoryCompressionEnabled !== initialConfig.current.toolHistoryCompressionEnabled) {
       formattedChanges.push(`${globalConfig.toolHistoryCompressionEnabled ? 'Enabled' : 'Disabled'} tool history compression`);
+    }
+    if (globalConfig.toolResultSummarizerEnabled !== initialConfig.current.toolResultSummarizerEnabled) {
+      formattedChanges.push(`${globalConfig.toolResultSummarizerEnabled ? 'Enabled' : 'Disabled'} tool result summarizer`);
     }
     if (globalConfig.respectGitignore !== initialConfig.current.respectGitignore) {
       formattedChanges.push(`${globalConfig.respectGitignore ? 'Enabled' : 'Disabled'} respect .gitignore in file picker`);

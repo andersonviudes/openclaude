@@ -1,0 +1,599 @@
+import { afterEach, beforeEach, expect, mock, test } from 'bun:test'
+import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
+
+// Mock analytics/metadata + index only (narrow surfaces, safe to replace).
+// Leave ./config.js as the real module — Bun test runner sets NODE_ENV=test,
+// so getGlobalConfig() returns TEST_GLOBAL_CONFIG_FOR_TESTING which starts with
+// DEFAULT_GLOBAL_CONFIG.toolResultSummarizerEnabled === true. Tests flip it via
+// saveGlobalConfig. This avoids mock.module pollution across test files in the
+// same run (config.js has 60+ exports; stubbing them all is fragile).
+mock.module('../services/analytics/metadata.js', () => ({
+  sanitizeToolNameForAnalytics: (name: string) =>
+    name.startsWith('mcp__') ? 'mcp_tool' : name,
+  // Stubs for transitive importers (firstPartyEventLoggingExporter etc.)
+  // that would otherwise fail to resolve against the mocked module.
+  isToolDetailsLoggingEnabled: () => false,
+  isAnalyticsToolDetailsLoggingEnabled: () => false,
+  mcpToolDetailsForAnalytics: () => ({}),
+  extractMcpToolDetails: () => ({}),
+  extractSkillName: () => undefined,
+  extractToolInputForTelemetry: () => ({}),
+  getFileExtensionForAnalytics: () => '',
+  getFileExtensionsFromBashCommand: () => [],
+  getEventMetadata: async () => ({}),
+  to1PEventFormat: () => ({}),
+}))
+
+const loggedEvents: Array<{ name: string; metadata: Record<string, unknown> }> =
+  []
+mock.module('../services/analytics/index.js', () => ({
+  logEvent: (name: string, metadata: Record<string, unknown>) => {
+    loggedEvents.push({ name, metadata })
+  },
+  logEventAsync: () => Promise.resolve(),
+  stripProtoFields: <T,>(m: T) => m,
+}))
+
+const {
+  maybeSummarizeToolResult,
+  isSummarizedContent,
+  TOOL_RESULT_SUMMARY_TAG,
+  TOOL_RESULT_SUMMARY_CLOSING_TAG,
+} = await import('./toolResultSummarizer.js')
+const { saveGlobalConfig } = await import('./config.js')
+
+const mockState = {
+  get enabled() {
+    return true
+  },
+  set enabled(value: boolean) {
+    saveGlobalConfig(c => ({ ...c, toolResultSummarizerEnabled: value }))
+  },
+}
+
+const originalEnv = process.env.OPENCLAUDE_DISABLE_TOOL_RESULT_SUMMARIZER
+
+beforeEach(() => {
+  mockState.enabled = true
+  delete process.env.OPENCLAUDE_DISABLE_TOOL_RESULT_SUMMARIZER
+  loggedEvents.length = 0
+})
+
+afterEach(() => {
+  mockState.enabled = true
+  if (originalEnv === undefined) {
+    delete process.env.OPENCLAUDE_DISABLE_TOOL_RESULT_SUMMARIZER
+  } else {
+    process.env.OPENCLAUDE_DISABLE_TOOL_RESULT_SUMMARIZER = originalEnv
+  }
+  loggedEvents.length = 0
+})
+
+function bigText(n: number, filler = 'x'): string {
+  return filler.repeat(n)
+}
+
+function makeBlock(
+  content: ToolResultBlockParam['content'],
+  id = 'toolu_t',
+): ToolResultBlockParam {
+  return {
+    type: 'tool_result',
+    tool_use_id: id,
+    content,
+  }
+}
+
+function asString(block: ToolResultBlockParam): string {
+  const c = block.content
+  if (typeof c !== 'string') {
+    throw new Error('expected string content')
+  }
+  return c
+}
+
+// ============================================================
+// Guards
+// ============================================================
+
+test('guard: passthrough when env var set truthy', () => {
+  process.env.OPENCLAUDE_DISABLE_TOOL_RESULT_SUMMARIZER = '1'
+  const block = makeBlock(bigText(20_000, 'abc\n'))
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+  expect(loggedEvents.length).toBe(0)
+})
+
+test('guard: passthrough when config flag disabled', () => {
+  mockState.enabled = false
+  const block = makeBlock(bigText(20_000, 'abc\n'))
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+  expect(loggedEvents.length).toBe(0)
+})
+
+test('guard: passthrough when content is null', () => {
+  const block = makeBlock(undefined)
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough when content is empty string', () => {
+  const block = makeBlock('')
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough when content is whitespace-only', () => {
+  const block = makeBlock('   \n\n  \t')
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough when content is array (non-string)', () => {
+  const block = makeBlock([{ type: 'text', text: 'hello' }])
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough below per-tool threshold', () => {
+  const block = makeBlock('line\n'.repeat(100))
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough for unknown tool', () => {
+  const block = makeBlock(bigText(50_000, 'abc\n'))
+  const out = maybeSummarizeToolResult(block, 'Read')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough when already summarized (idempotency)', () => {
+  const summarized = `${TOOL_RESULT_SUMMARY_TAG} tool="Bash" original="10KB" kept="1KB" strategy="head-tail-errors">\nfoo\n${TOOL_RESULT_SUMMARY_CLOSING_TAG}`
+  const block = makeBlock(summarized)
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('guard: passthrough when already persisted', () => {
+  const persisted = '<persisted-output>\nPath: /tmp/foo.txt\n</persisted-output>'
+  const block = makeBlock(persisted)
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+// ============================================================
+// Bash strategy
+// ============================================================
+
+test('bash: JSON object passthrough', () => {
+  const json = `{"items":[${Array.from({ length: 1000 }, (_, i) => `"item-${i}-xyz"`).join(',')}]}`
+  expect(json.length).toBeGreaterThan(8_000)
+  const block = makeBlock(json)
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('bash: JSON array passthrough', () => {
+  const json = `[${Array.from({ length: 2000 }, (_, i) => `"x-${i}"`).join(',')}]`
+  expect(json.length).toBeGreaterThan(8_000)
+  const block = makeBlock(json)
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  expect(out).toBe(block)
+})
+
+test('bash: error window preserves Python Traceback', () => {
+  const pad = ' filler content that pads the line meaningfully'
+  const filler = Array.from({ length: 300 }, (_, i) => `normal line ${i}${pad}`).join('\n')
+  const traceback = [
+    'Traceback (most recent call last):',
+    '  File "app.py", line 42, in <module>',
+    '    main()',
+    '  File "app.py", line 17, in main',
+    '    raise ValueError("boom")',
+    'ValueError: boom',
+  ].join('\n')
+  const tail = Array.from({ length: 100 }, (_, i) => `later line ${i}${pad}`).join('\n')
+  const content = `${filler}\n${traceback}\n${tail}`
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body.startsWith(TOOL_RESULT_SUMMARY_TAG)).toBe(true)
+  expect(body).toContain('Traceback (most recent call last):')
+  expect(body).toContain('ValueError: boom')
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt).toBeDefined()
+  expect(evt?.metadata.errorWindowPreserved).toBe(true)
+  expect(evt?.metadata.strategyId).toBe(1)
+})
+
+test('bash: Node Error preserved', () => {
+  const pad = ' padding words for length'
+  const head = Array.from({ length: 200 }, (_, i) => `info ${i}${pad}`).join('\n')
+  const mid = Array.from({ length: 200 }, (_, i) => `chatter ${i}${pad}`).join('\n')
+  const err = [
+    'Error: something went wrong',
+    '    at Object.<anonymous> (/path/to/file.js:12:15)',
+    '    at Module._compile (node:internal/modules/cjs/loader:1254:14)',
+  ].join('\n')
+  const tail = Array.from({ length: 100 }, (_, i) => `later ${i}${pad}`).join('\n')
+  const content = `${head}\n${mid}\n${err}\n${tail}`
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('Error: something went wrong')
+})
+
+test('bash: Exit code preserved', () => {
+  const pad = ' padding words for length'
+  const head = Array.from({ length: 100 }, (_, i) => `hello ${i}${pad}`).join('\n')
+  const mid = Array.from({ length: 300 }, (_, i) => `chatter ${i}${pad}`).join('\n')
+  const tail = Array.from({ length: 100 }, (_, i) => `later ${i}${pad}`).join('\n')
+  const content = `${head}\n${mid}\nExit code: 42\n${tail}`
+  expect(content.length).toBeGreaterThan(8_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('Exit code: 42')
+})
+
+test('bash: progress bar CR dedupe (\\r-last-segment)', () => {
+  const prog = Array.from({ length: 200 }, (_, i) => `progress\rstep ${i}: ok`).join('\n')
+  const filler = Array.from({ length: 500 }, () => 'filler line').join('\n')
+  const content = `${prog}\n${filler}`
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  // CR collapse happened: no "progress\rstep" substring.
+  expect(body).not.toContain('progress\rstep')
+  // At least one collapsed progress marker survives via head capture.
+  expect(body).toMatch(/step \d+: ok/)
+})
+
+test('bash: identical run dedupe (×N marker)', () => {
+  const dup = Array.from({ length: 300 }, () => 'same line with some repeating text content here').join('\n')
+  const tail = Array.from({ length: 100 }, (_, i) => `final entry number ${i} with padding content`).join('\n')
+  const content = `start\n${dup}\n${tail}`
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('same line with some repeating text content here (×')
+})
+
+test('bash: digit-template dedupe (N updates)', () => {
+  const mid = Array.from({ length: 200 }, (_, i) => `processing file ${i} of many items`).join('\n')
+  const head = Array.from({ length: 5 }, (_, i) => `head ${i} of stuff`).join('\n')
+  const tail = Array.from({ length: 100 }, (_, i) => `tail entry ${i} padding content`).join('\n')
+  const content = `${head}\n${mid}\n${tail}`
+  expect(content.length).toBeGreaterThan(8_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toMatch(/processing file \d+ of many items \(\d+ updates\)/)
+})
+
+test('bash: head+tail without error emits omitted marker', () => {
+  // Vary shape per line so digit-template dedupe does NOT collapse the input —
+  // we want to exercise head+tail omission of mid-stream lines.
+  const words = ['apple', 'banana', 'cherry', 'donut', 'eggplant', 'fig', 'grape']
+  const lines = Array.from(
+    { length: 500 },
+    (_, i) => `${words[i % words.length]} row ${i} payload ${'x'.repeat(30)}`,
+  ).join('\n')
+  expect(lines.length).toBeGreaterThan(8_000)
+  const out = maybeSummarizeToolResult(makeBlock(lines), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('bash output omitted')
+  // Head captured (first line).
+  expect(body).toContain('apple row 0 payload')
+  // Tail captured (last line — 499 % 7 = 2 → cherry).
+  expect(body).toContain('cherry row 499 payload')
+  // Middle is NOT in head/tail and no error — should be omitted.
+  expect(body).not.toContain('row 250 payload')
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.errorWindowPreserved).toBe(false)
+})
+
+// ============================================================
+// Grep strategy
+// ============================================================
+
+test('grep: count-mode passthrough', () => {
+  const lines = Array.from({ length: 500 }, (_, i) => `path/to/file${i}.ts:${i + 1}`)
+  const content = lines.join('\n')
+  expect(content.length).toBeGreaterThan(6_000)
+  const block = makeBlock(content)
+  const out = maybeSummarizeToolResult(block, 'Grep')
+  expect(out).toBe(block)
+})
+
+test('grep: grouped by file with per-file cap', () => {
+  const pad = ' xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+  const aLines = Array.from({ length: 40 }, (_, i) => `src/a.ts:${i + 1}:match line ${i}${pad}`)
+  const bLines = Array.from({ length: 20 }, (_, i) => `src/b.ts:${i + 1}:match line ${i}${pad}`)
+  const cLines = Array.from({ length: 5 }, (_, i) => `src/c.ts:${i + 1}:match line ${i}${pad}`)
+  const content = [...aLines, ...bLines, ...cLines].join('\n')
+  expect(content.length).toBeGreaterThan(6_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Grep')
+  const body = asString(out)
+  expect(body.startsWith(TOOL_RESULT_SUMMARY_TAG)).toBe(true)
+  expect(body).toContain('Grep summary:')
+  expect(body).toContain('files=3')
+  expect(body).toContain('src/a.ts (40 matches)')
+  expect(body).toContain('src/b.ts (20 matches)')
+  // Per-file cap of 10 → +30 more matches for a.ts.
+  expect(body).toContain('src/a.ts: +30 more')
+  expect(body).toContain('src/b.ts: +10 more')
+  // c.ts has 5 so no "+X more" line.
+  expect(body).toContain('src/c.ts (5 matches)')
+  expect(body).not.toMatch(/src\/c\.ts: \+\d+ more/)
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.strategyId).toBe(2)
+})
+
+test('grep: preserves exact totals in header (no silent cut)', () => {
+  const lines = Array.from({ length: 600 }, (_, i) => `file${i % 3}.ts:${i + 1}:content ${i}`).join('\n')
+  expect(lines.length).toBeGreaterThan(6_000)
+  const out = maybeSummarizeToolResult(makeBlock(lines), 'Grep')
+  const body = asString(out)
+  expect(body).toContain('matches=600')
+})
+
+test('grep: other bucket preserves non-matching lines literally', () => {
+  const parsable = Array.from({ length: 200 }, (_, i) => `src/a.ts:${i + 1}:hit ${i}`).join('\n')
+  const binary = 'Binary file matches'
+  const rgErr = 'rg: /opt/x: Permission denied'
+  const content = `${parsable}\n${binary}\n${rgErr}\n${'xx '.repeat(2000)}`
+  expect(content.length).toBeGreaterThan(6_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Grep')
+  const body = asString(out)
+  expect(body).toContain('other (preserved literally)')
+  expect(body).toContain('Binary file matches')
+  expect(body).toContain('rg: /opt/x: Permission denied')
+})
+
+test('grep: global cap with omitted-files marker', () => {
+  // 60 distinct files, each with 3 matches → exceeds GREP_MAX_FILES=50.
+  // Pad line text so the whole payload clears 6K threshold.
+  const lines: string[] = []
+  for (let f = 0; f < 60; f++) {
+    for (let m = 1; m <= 3; m++) {
+      lines.push(
+        `src/file${f}.ts:${m}:match text ${f}-${m} ${'padding '.repeat(6)}`,
+      )
+    }
+  }
+  const content = lines.join('\n')
+  expect(content.length).toBeGreaterThan(6_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Grep')
+  const body = asString(out)
+  expect(body).toContain('files=60')
+  expect(body).toContain('matches=180')
+  expect(body).toMatch(/<omitted>: 10 files, 30 matches not shown/)
+})
+
+// ============================================================
+// WebFetch strategy
+// ============================================================
+
+test('webfetch: strips script/style for HTML-dense content', () => {
+  const scripts = Array.from(
+    { length: 30 },
+    (_, i) => `<script>var x${i} = ${'a'.repeat(400)};</script>`,
+  ).join('\n')
+  const styles = Array.from(
+    { length: 10 },
+    (_, i) => `<style>.c${i} { color: red; ${'b'.repeat(200)} }</style>`,
+  ).join('\n')
+  const body = 'actual content\n' + Array.from({ length: 200 }, (_, i) => `paragraph ${i}`).join('\n')
+  const content = `<!DOCTYPE html>\n${scripts}\n${styles}\n${body}`
+  expect(content.length).toBeGreaterThan(12_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  const outStr = asString(out)
+  expect(outStr).not.toContain('<script>')
+  expect(outStr).not.toContain('</script>')
+  expect(outStr).not.toContain('<style>')
+  expect(outStr).toContain('actual content')
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.strategyId).toBe(3)
+})
+
+test('webfetch: markdown passthrough to head+tail strategy', () => {
+  // Pure markdown (no HTML markers) above threshold.
+  const lines = Array.from({ length: 500 }, (_, i) => `paragraph with some content ${i} and extra text ${'y'.repeat(20)}`).join('\n')
+  expect(lines.length).toBeGreaterThan(12_000)
+  const out = maybeSummarizeToolResult(makeBlock(lines), 'WebFetch')
+  const body = asString(out)
+  expect(body).toContain('webfetch content omitted')
+  expect(body).toContain('paragraph with some content 0')
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.strategyId).toBe(4)
+})
+
+test('webfetch: preserves markdown-style title in first 3 lines', () => {
+  const title = '# Important Title'
+  const lines = Array.from({ length: 500 }, (_, i) => `line ${i} ${'z'.repeat(20)}`).join('\n')
+  const content = `${title}\n${lines}`
+  expect(content.length).toBeGreaterThan(12_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  const body = asString(out)
+  expect(body).toContain('# Important Title')
+})
+
+test('webfetch: preserves Title: prefix', () => {
+  const title = 'Title: My Page'
+  const lines = Array.from({ length: 500 }, (_, i) => `filler ${i} ${'z'.repeat(20)}`).join('\n')
+  const content = `${title}\n${lines}`
+  expect(content.length).toBeGreaterThan(12_000)
+  const out = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  expect(asString(out)).toContain('Title: My Page')
+})
+
+// ============================================================
+// Marker format snapshots
+// ============================================================
+
+test('snapshot: Bash marker shape', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `${['alpha', 'beta', 'gamma', 'delta'][i % 4]} row ${i} ${'x'.repeat(20)}`).join('\n')
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toMatch(
+    /^<tool-result-summary tool="Bash" original="\d+(\.\d)?(KB|MB|bytes)" kept="\d+(\.\d)?(KB|MB|bytes)" strategy="head-tail-errors">\n/,
+  )
+  expect(body.endsWith('</tool-result-summary>')).toBe(true)
+})
+
+test('snapshot: Grep marker shape', () => {
+  const lines = Array.from({ length: 400 }, (_, i) => `src/f${i % 5}.ts:${i + 1}:hit ${i} ${'p'.repeat(10)}`).join('\n')
+  const out = maybeSummarizeToolResult(makeBlock(lines), 'Grep')
+  const body = asString(out)
+  expect(body).toMatch(
+    /^<tool-result-summary tool="Grep" original="\d+(\.\d)?(KB|MB|bytes)" kept="\d+(\.\d)?(KB|MB|bytes)" strategy="grep-grouped">\n/,
+  )
+})
+
+test('snapshot: WebFetch stripped marker shape', () => {
+  const scripts = Array.from({ length: 30 }, (_, i) => `<script>${'a'.repeat(400)}; // ${i}</script>`).join('\n')
+  const body0 = Array.from({ length: 200 }, (_, i) => `p ${i}`).join('\n')
+  const content = `<!DOCTYPE html>\n${scripts}\n${body0}`
+  const out = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  const body = asString(out)
+  expect(body).toMatch(/strategy="webfetch-stripped"/)
+})
+
+test('snapshot: WebFetch head-tail marker shape', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `markdown paragraph ${i} ${'z'.repeat(30)}`).join('\n')
+  const out = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  const body = asString(out)
+  expect(body).toMatch(/strategy="webfetch-head-tail"/)
+})
+
+// ============================================================
+// Property: idempotency
+// ============================================================
+
+test('property: idempotent (summarize∘summarize = summarize)', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `${['alpha', 'beta', 'gamma', 'delta'][i % 4]} row ${i} ${'x'.repeat(20)}`).join('\n')
+  const first = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const second = maybeSummarizeToolResult(first, 'Bash')
+  expect(second).toBe(first) // same reference — guard hits
+  expect(asString(second)).toBe(asString(first))
+})
+
+test('property: idempotent for Grep', () => {
+  const lines = Array.from({ length: 300 }, (_, i) => `src/f${i % 4}.ts:${i + 1}:match ${i}`).join('\n')
+  const first = maybeSummarizeToolResult(makeBlock(lines), 'Grep')
+  const second = maybeSummarizeToolResult(first, 'Grep')
+  expect(second).toBe(first)
+})
+
+test('property: idempotent for WebFetch', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `p ${i} ${'q'.repeat(30)}`).join('\n')
+  const first = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  const second = maybeSummarizeToolResult(first, 'WebFetch')
+  expect(second).toBe(first)
+})
+
+// ============================================================
+// Property: determinism (byte-identical across runs)
+// ============================================================
+
+test('property: deterministic (byte-identical output, Bash)', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `${['alpha', 'beta', 'gamma', 'delta'][i % 4]} row ${i} ${'x'.repeat(20)}`).join('\n')
+  const a = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const b = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  expect(asString(a)).toBe(asString(b))
+})
+
+test('property: deterministic (byte-identical output, Grep)', () => {
+  const lines = Array.from({ length: 300 }, (_, i) => `src/f${i % 5}.ts:${i + 1}:match ${i}`).join('\n')
+  const a = maybeSummarizeToolResult(makeBlock(lines), 'Grep')
+  const b = maybeSummarizeToolResult(makeBlock(lines), 'Grep')
+  expect(asString(a)).toBe(asString(b))
+})
+
+test('property: deterministic (byte-identical output, WebFetch)', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `para ${i} ${'w'.repeat(30)}`).join('\n')
+  const a = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  const b = maybeSummarizeToolResult(makeBlock(content), 'WebFetch')
+  expect(asString(a)).toBe(asString(b))
+})
+
+// ============================================================
+// Error handling: try/catch global
+// ============================================================
+
+test('never throws: pathological input returns original block', () => {
+  // Crafted to be huge but survive — we mostly just verify no throws.
+  const content = '\x00'.repeat(30_000)
+  const block = makeBlock(content)
+  const out = maybeSummarizeToolResult(block, 'Bash')
+  // Either summarized or passthrough — but must not throw. And must be a
+  // valid ToolResultBlockParam either way.
+  expect(out.type).toBe('tool_result')
+})
+
+// ============================================================
+// isSummarizedContent
+// ============================================================
+
+test('isSummarizedContent: true for summarized string', () => {
+  const s = `${TOOL_RESULT_SUMMARY_TAG} tool="Bash" original="10KB" kept="1KB" strategy="head-tail-errors">\nx\n${TOOL_RESULT_SUMMARY_CLOSING_TAG}`
+  expect(isSummarizedContent(s)).toBe(true)
+})
+
+test('isSummarizedContent: false for plain string', () => {
+  expect(isSummarizedContent('hello')).toBe(false)
+  expect(isSummarizedContent('')).toBe(false)
+})
+
+test('isSummarizedContent: false for non-string', () => {
+  expect(isSummarizedContent(null)).toBe(false)
+  expect(isSummarizedContent(undefined)).toBe(false)
+  expect(isSummarizedContent(42)).toBe(false)
+  expect(isSummarizedContent([])).toBe(false)
+  expect(isSummarizedContent({})).toBe(false)
+})
+
+// ============================================================
+// Analytics event schema
+// ============================================================
+
+test('analytics: event schema matches plan', () => {
+  const content = Array.from({ length: 500 }, (_, i) => `${['alpha', 'beta', 'gamma', 'delta'][i % 4]} row ${i} ${'x'.repeat(20)}`).join('\n')
+  maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt).toBeDefined()
+  const m = evt!.metadata
+  expect(typeof m.toolName).toBe('string')
+  expect(typeof m.originalSizeBytes).toBe('number')
+  expect(typeof m.summarizedSizeBytes).toBe('number')
+  expect(typeof m.estimatedOriginalTokens).toBe('number')
+  expect(typeof m.estimatedSummarizedTokens).toBe('number')
+  expect([1, 2, 3, 4]).toContain(m.strategyId as number)
+  expect(typeof m.reductionPct).toBe('number')
+  // errorWindowPreserved must be boolean for Bash.
+  expect(typeof m.errorWindowPreserved).toBe('boolean')
+})
+
+test('analytics: not emitted on passthrough (below threshold)', () => {
+  const block = makeBlock('small\n'.repeat(10))
+  maybeSummarizeToolResult(block, 'Bash')
+  expect(
+    loggedEvents.some(e => e.name === 'openclaude_tool_result_summarized'),
+  ).toBe(false)
+})
+
+test('analytics: not emitted when flag off', () => {
+  mockState.enabled = false
+  const block = makeBlock(bigText(20_000, 'abc\n'))
+  maybeSummarizeToolResult(block, 'Bash')
+  expect(
+    loggedEvents.some(e => e.name === 'openclaude_tool_result_summarized'),
+  ).toBe(false)
+})

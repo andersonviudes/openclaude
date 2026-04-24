@@ -22,6 +22,10 @@ import { formatFileSize } from './format.js'
 import { logError } from './log.js'
 import { getProjectDir } from './sessionStorage.js'
 import { jsonStringify } from './slowOperations.js'
+import {
+  TOOL_RESULT_SUMMARY_TAG,
+  maybeSummarizeToolResult,
+} from './toolResultSummarizer.js'
 
 // Subdirectory name for tool results within a session
 export const TOOL_RESULTS_SUBDIR = 'tool-results'
@@ -218,8 +222,9 @@ export async function processToolResultBlock<T>(
     toolUseResult,
     toolUseID,
   )
+  const summarized = maybeSummarizeToolResult(toolResultBlock, tool.name)
   return maybePersistLargeToolResult(
-    toolResultBlock,
+    summarized,
     tool.name,
     getPersistenceThreshold(tool.name, tool.maxResultSizeChars),
   )
@@ -234,8 +239,9 @@ export async function processPreMappedToolResultBlock(
   toolName: string,
   maxResultSizeChars: number,
 ): Promise<ToolResultBlockParam> {
+  const summarized = maybeSummarizeToolResult(toolResultBlock, toolName)
   return maybePersistLargeToolResult(
-    toolResultBlock,
+    summarized,
     toolName,
     getPersistenceThreshold(toolName, maxResultSizeChars),
   )
@@ -499,9 +505,15 @@ function isContentAlreadyCompacted(
   content: ToolResultBlockParam['content'],
 ): boolean {
   // All budget-produced content starts with the tag (buildLargeToolResultMessage).
-  // `.startsWith()` avoids false-positives when the tag appears anywhere else
-  // in the content (e.g., reading this source file).
-  return typeof content === 'string' && content.startsWith(PERSISTED_OUTPUT_TAG)
+  // Summarizer-produced content starts with TOOL_RESULT_SUMMARY_TAG. Either
+  // marker at the very start is an idempotency signal. `.startsWith()` avoids
+  // false-positives when the tag appears anywhere else in the content (e.g.,
+  // reading this source file).
+  if (typeof content !== 'string') return false
+  return (
+    content.startsWith(PERSISTED_OUTPUT_TAG) ||
+    content.startsWith(TOOL_RESULT_SUMMARY_TAG)
+  )
 }
 
 function hasImageBlock(

@@ -1,0 +1,563 @@
+/**
+ * Tool result summarizer — opportunistic per-tool compression of oversized
+ * Bash/Grep/WebFetch outputs as they enter conversation history.
+ *
+ * Pure, deterministic, zero I/O. Runs once per tool_result, upstream of
+ * persistence. All strategies preserve the exact totals the model would
+ * need to reason about the raw output (error windows for Bash, match
+ * counts for Grep, head+tail for WebFetch). On ANY unexpected error the
+ * original block is returned — this module must never break a turn.
+ */
+import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
+import { BYTES_PER_TOKEN } from '../constants/toolLimits.js'
+import { logEvent } from '../services/analytics/index.js'
+import { sanitizeToolNameForAnalytics } from '../services/analytics/metadata.js'
+import { BASH_TOOL_NAME } from '../tools/BashTool/toolName.js'
+import { GREP_TOOL_NAME } from '../tools/GrepTool/prompt.js'
+import { WEB_FETCH_TOOL_NAME } from '../tools/WebFetchTool/prompt.js'
+import { getGlobalConfig } from './config.js'
+import { logForDebugging } from './debug.js'
+import { isEnvTruthy } from './envUtils.js'
+import { formatFileSize } from './format.js'
+
+// Opening tag is intentionally incomplete ("<tool-result-summary" without '>')
+// so attribute-carrying markers still match `startsWith` checks verbatim.
+export const TOOL_RESULT_SUMMARY_TAG = '<tool-result-summary'
+export const TOOL_RESULT_SUMMARY_CLOSING_TAG = '</tool-result-summary>'
+
+// Per-tool thresholds (chars). Kept local to avoid importing toolLimits cycles.
+const BASH_SUMMARIZE_THRESHOLD = 8_000
+const GREP_SUMMARIZE_THRESHOLD = 6_000
+const WEBFETCH_SUMMARIZE_THRESHOLD = 12_000
+
+// Strategy enum numeric IDs (analytics payloads only accept boolean|number).
+const STRATEGY_ID: Record<StrategyName, number> = {
+  'head-tail-errors': 1,
+  'grep-grouped': 2,
+  'webfetch-stripped': 3,
+  'webfetch-head-tail': 4,
+}
+
+type StrategyName =
+  | 'head-tail-errors'
+  | 'grep-grouped'
+  | 'webfetch-stripped'
+  | 'webfetch-head-tail'
+
+type StrategyResult = {
+  body: string
+  strategy: StrategyName
+  errorWindowPreserved?: boolean
+}
+
+/**
+ * True when content was produced by this summarizer. Cheap anchored check:
+ * the tag is only emitted as the first byte of our marker, never mid-stream.
+ */
+export function isSummarizedContent(content: unknown): boolean {
+  return (
+    typeof content === 'string' && content.startsWith(TOOL_RESULT_SUMMARY_TAG)
+  )
+}
+
+/**
+ * Entry point. Returns the input block unchanged for all passthrough cases
+ * (disabled, unknown tool, below threshold, non-string, image, already
+ * summarized, etc.). On any thrown error inside a strategy, logs and
+ * returns the original block — never breaks a turn.
+ */
+export function maybeSummarizeToolResult(
+  block: ToolResultBlockParam,
+  toolName: string,
+): ToolResultBlockParam {
+  try {
+    // Guard 1: env var kill switch (highest precedence).
+    if (isEnvTruthy(process.env.OPENCLAUDE_DISABLE_TOOL_RESULT_SUMMARIZER)) {
+      return block
+    }
+
+    // Guard 2: config toggle.
+    if (!getGlobalConfig().toolResultSummarizerEnabled) {
+      return block
+    }
+
+    const content = block.content
+
+    // Guard 3: null/undefined.
+    if (content == null) return block
+
+    // Guard 4: empty — handled downstream by maybePersistLargeToolResult
+    // with a marker injection; passthrough here.
+    if (isToolResultContentEmpty(content)) return block
+
+    // Guard 5: not a string (array of content blocks). Summarizer phase 1
+    // only handles plain text results.
+    if (typeof content !== 'string') return block
+
+    // Guard 6: image blocks — belt-and-suspenders; typeof check above
+    // already excludes arrays, but keep the guard explicit in case
+    // ToolResultBlockParam ever widens.
+    if (hasImageContentBlock(content)) return block
+
+    // Guard 7: already summarized or persisted — idempotency.
+    if (isAlreadyCompacted(content)) return block
+
+    // Guard 8 + 9: dispatch by tool name and per-tool threshold.
+    const strategyResult = dispatch(toolName, content)
+    if (strategyResult === null) return block
+
+    const originalSizeBytes = content.length
+    const wrapped = wrapMarker(
+      toolName,
+      originalSizeBytes,
+      strategyResult.body.length,
+      strategyResult.strategy,
+      strategyResult.body,
+    )
+
+    // No-win guard: if wrapping didn't actually save bytes (tiny inputs,
+    // pathological cases), bail rather than mislead the cache.
+    if (wrapped.length >= originalSizeBytes) return block
+
+    const summarizedSizeBytes = wrapped.length
+
+    logEvent('openclaude_tool_result_summarized', {
+      toolName: sanitizeToolNameForAnalytics(toolName),
+      originalSizeBytes,
+      summarizedSizeBytes,
+      estimatedOriginalTokens: Math.ceil(originalSizeBytes / BYTES_PER_TOKEN),
+      estimatedSummarizedTokens: Math.ceil(
+        summarizedSizeBytes / BYTES_PER_TOKEN,
+      ),
+      strategyId: STRATEGY_ID[strategyResult.strategy],
+      errorWindowPreserved: strategyResult.errorWindowPreserved,
+      reductionPct: Math.floor(
+        100 * (1 - summarizedSizeBytes / originalSizeBytes),
+      ),
+    })
+
+    return { ...block, content: wrapped }
+  } catch (error) {
+    logForDebugging(
+      `maybeSummarizeToolResult: error for tool ${toolName}: ${(error as Error)?.message ?? String(error)}`,
+      { level: 'warn' },
+    )
+    return block
+  }
+}
+
+// ---------- dispatch ----------
+
+function dispatch(toolName: string, text: string): StrategyResult | null {
+  switch (toolName) {
+    case BASH_TOOL_NAME:
+      if (text.length < BASH_SUMMARIZE_THRESHOLD) return null
+      return summarizeBashOutput(text)
+    case GREP_TOOL_NAME:
+      if (text.length < GREP_SUMMARIZE_THRESHOLD) return null
+      return summarizeGrepOutput(text)
+    case WEB_FETCH_TOOL_NAME:
+      if (text.length < WEBFETCH_SUMMARIZE_THRESHOLD) return null
+      return summarizeWebFetchOutput(text)
+    default:
+      return null
+  }
+}
+
+// ---------- marker ----------
+
+function wrapMarker(
+  toolName: string,
+  originalBytes: number,
+  keptBytes: number,
+  strategy: StrategyName,
+  body: string,
+): string {
+  const original = formatFileSize(originalBytes)
+  const kept = formatFileSize(keptBytes)
+  return (
+    `${TOOL_RESULT_SUMMARY_TAG} tool="${toolName}" original="${original}" kept="${kept}" strategy="${strategy}">\n` +
+    body +
+    `\n${TOOL_RESULT_SUMMARY_CLOSING_TAG}`
+  )
+}
+
+// ---------- shared guards (local to avoid import cycle into toolResultStorage) ----------
+
+function isToolResultContentEmpty(
+  content: ToolResultBlockParam['content'],
+): boolean {
+  if (!content) return true
+  if (typeof content === 'string') return content.trim() === ''
+  if (!Array.isArray(content)) return false
+  if (content.length === 0) return true
+  return content.every(
+    block =>
+      typeof block === 'object' &&
+      'type' in block &&
+      block.type === 'text' &&
+      'text' in block &&
+      (typeof block.text !== 'string' || block.text.trim() === ''),
+  )
+}
+
+// String-only shim: the caller ensures content is a string, so the only
+// "image" surface is a provider that pre-embedded a data URL in text —
+// out of scope. Kept as an always-false stub so the guard site reads
+// symmetrically with toolResultStorage.hasImageBlock on arrays.
+function hasImageContentBlock(_text: string): boolean {
+  return false
+}
+
+function isAlreadyCompacted(text: string): boolean {
+  // <persisted-output> or <tool-result-summary (either marker at start)
+  return (
+    text.startsWith('<persisted-output>') ||
+    text.startsWith(TOOL_RESULT_SUMMARY_TAG)
+  )
+}
+
+// ============================================================
+// Strategy 1: Bash
+// ============================================================
+
+const BASH_HEAD_LINES = 40
+const BASH_TAIL_LINES = 60
+const BASH_ERROR_BEFORE = 5
+const BASH_ERROR_AFTER = 10
+const BASH_MAX_LINE_WIDTH = 500
+
+// Matches common error signatures on any line. `Error`/`Exception` are kept
+// unanchored so they catch compound names like `ValueError`, `TypeError`,
+// `RuntimeException`. `Traceback (...)` is literal — the closing paren + colon
+// means a trailing `\b` wouldn't fire. `fatal:` / `panic:` / `FAIL`/`FAILED`
+// match git/Go/CI output. The `Exit code:` alternative anchors to the full
+// line via `^...$` with the /m flag.
+const BASH_ERROR_REGEX =
+  /(Error|Exception|Traceback \(most recent call last\):|panic:|fatal:|undefined reference to)|\bFAIL(?:ED)?\b|^Exit code: [1-9]\d*$/m
+
+function summarizeBashOutput(text: string): StrategyResult | null {
+  // JSON passthrough — never mutate structured data.
+  const trimmed = text.trimStart()
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      JSON.parse(trimmed)
+      return null
+    } catch {
+      // fall through: not valid JSON, treat as text
+    }
+  }
+
+  // CR-collapse each line: capture only the final segment after CR
+  // (progress bars render N times per line via \r).
+  const rawLines = text.split('\n')
+  const crCollapsed = rawLines.map(line => {
+    const parts = line.split('\r')
+    return parts[parts.length - 1] ?? ''
+  })
+
+  // Collapse runs of identical lines.
+  const runCollapsed = collapseIdenticalRuns(crCollapsed)
+
+  // Collapse lines that differ only by digits → template with update count.
+  const templateCollapsed = collapseDigitTemplates(runCollapsed)
+
+  // Find error windows.
+  const errorIdx = findErrorIndices(templateCollapsed)
+
+  const total = templateCollapsed.length
+
+  // Pick head/tail ranges and add error windows outside those ranges.
+  const headEnd = Math.min(BASH_HEAD_LINES, total)
+  const tailStart = Math.max(headEnd, total - BASH_TAIL_LINES)
+
+  const keep = new Array<boolean>(total).fill(false)
+  for (let i = 0; i < headEnd; i++) keep[i] = true
+  for (let i = tailStart; i < total; i++) keep[i] = true
+
+  let errorWindowPreserved = false
+  for (const idx of errorIdx) {
+    if (idx < headEnd || idx >= tailStart) {
+      // Already inside head/tail.
+      errorWindowPreserved = true
+      continue
+    }
+    const from = Math.max(0, idx - BASH_ERROR_BEFORE)
+    const to = Math.min(total, idx + BASH_ERROR_AFTER + 1)
+    for (let i = from; i < to; i++) keep[i] = true
+    errorWindowPreserved = true
+  }
+
+  // Assemble output, inserting omission markers for contiguous skipped runs.
+  const parts: string[] = []
+  let i = 0
+  while (i < total) {
+    if (keep[i]) {
+      parts.push(truncateLine(templateCollapsed[i] ?? ''))
+      i++
+      continue
+    }
+    // Skip run — measure it.
+    let j = i
+    let skippedChars = 0
+    while (j < total && !keep[j]) {
+      skippedChars += (templateCollapsed[j] ?? '').length + 1 // +1 for the newline
+      j++
+    }
+    const skippedLines = j - i
+    parts.push(
+      `[…bash output omitted: ${skippedLines} lines, ${formatFileSize(skippedChars)}…]`,
+    )
+    i = j
+  }
+
+  return {
+    body: parts.join('\n'),
+    strategy: 'head-tail-errors',
+    errorWindowPreserved: errorIdx.length > 0 ? errorWindowPreserved : false,
+  }
+}
+
+function collapseIdenticalRuns(lines: string[]): string[] {
+  if (lines.length === 0) return lines
+  const out: string[] = []
+  let runLine = lines[0] ?? ''
+  let runCount = 1
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    if (line === runLine) {
+      runCount++
+      continue
+    }
+    out.push(runCount > 1 ? `${runLine} (×${runCount})` : runLine)
+    runLine = line
+    runCount = 1
+  }
+  out.push(runCount > 1 ? `${runLine} (×${runCount})` : runLine)
+  return out
+}
+
+// Collapse runs of lines that only differ by digits. Only collapses runs of
+// DIGIT_TEMPLATE_MIN_RUN or more so legitimate line-numbered logs survive
+// (e.g. consecutive `line 1`/`line 2` debug output); aggressive enough to
+// catch progress bars / percentage dumps / tick counters.
+const DIGIT_TEMPLATE_MIN_RUN = 5
+
+function collapseDigitTemplates(lines: string[]): string[] {
+  if (lines.length === 0) return lines
+  const out: string[] = []
+  let template: string | null = null
+  let runStart = 0
+  let runCount = 0
+
+  const emitRun = (endExclusive: number) => {
+    if (runCount >= DIGIT_TEMPLATE_MIN_RUN) {
+      // One sample line + count marker.
+      out.push(`${lines[runStart] ?? ''} (${runCount} updates)`)
+    } else {
+      // Preserve each line as-is.
+      for (let i = runStart; i < endExclusive; i++) {
+        out.push(lines[i] ?? '')
+      }
+    }
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? ''
+    const t = line.replace(/\d+/g, '#')
+    if (template !== null && t === template) {
+      runCount++
+      continue
+    }
+    if (template !== null) emitRun(i)
+    template = t
+    runStart = i
+    runCount = 1
+  }
+  if (template !== null) emitRun(lines.length)
+  return out
+}
+
+function findErrorIndices(lines: string[]): number[] {
+  const out: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (BASH_ERROR_REGEX.test(lines[i] ?? '')) out.push(i)
+  }
+  // Keep only first and last to bound error-window explosion.
+  if (out.length <= 2) return out
+  return [out[0]!, out[out.length - 1]!]
+}
+
+function truncateLine(line: string): string {
+  if (line.length <= BASH_MAX_LINE_WIDTH) return line
+  return (
+    line.slice(0, BASH_MAX_LINE_WIDTH) + `…[${line.length - BASH_MAX_LINE_WIDTH}b]`
+  )
+}
+
+// ============================================================
+// Strategy 2: Grep
+// ============================================================
+
+const GREP_MAX_MATCHES_PER_FILE = 10
+const GREP_MAX_FILES = 50
+
+function summarizeGrepOutput(text: string): StrategyResult | null {
+  const lines = text.split('\n').filter(l => l.length > 0)
+  if (lines.length === 0) return null
+
+  // Count-mode passthrough: if ≥80% of lines look like `path:count`,
+  // the output is already small and structured.
+  const countLineRegex = /^[^:]+:\d+$/
+  const countLineMatches = lines.reduce(
+    (n, l) => (countLineRegex.test(l) ? n + 1 : n),
+    0,
+  )
+  if (countLineMatches / lines.length >= 0.8) return null
+
+  // Parse lines into (file, lineNumber, text). Non-matching lines go to
+  // "other" bucket preserved verbatim.
+  const matchRegex = /^([^:]+):(\d+):(.*)$/
+  // Plain object with explicit sorted iteration for determinism.
+  const byFile: Record<string, Array<{ line: string; n: number }>> = {}
+  const files: string[] = []
+  const other: string[] = []
+  let totalMatches = 0
+
+  for (const line of lines) {
+    const m = matchRegex.exec(line)
+    if (!m) {
+      other.push(line)
+      continue
+    }
+    const file = m[1]!
+    if (!(file in byFile)) {
+      byFile[file] = []
+      files.push(file)
+    }
+    byFile[file]!.push({ line, n: Number(m[2]) })
+    totalMatches++
+  }
+
+  if (files.length === 0) return null
+
+  // Sort files: primary by match count DESC, secondary by filename ASC
+  // — pure deterministic ordering (no Map iteration, no Date).
+  const sortedFiles = [...files].sort((a, b) => {
+    const diff = (byFile[b]?.length ?? 0) - (byFile[a]?.length ?? 0)
+    if (diff !== 0) return diff
+    return a < b ? -1 : a > b ? 1 : 0
+  })
+
+  const kept = sortedFiles.slice(0, GREP_MAX_FILES)
+  const dropped = sortedFiles.slice(GREP_MAX_FILES)
+
+  const body: string[] = []
+  body.push(
+    `Grep summary: files=${files.length}, matches=${totalMatches}` +
+      (other.length > 0 ? `, other=${other.length}` : ''),
+  )
+
+  for (const file of kept) {
+    const entries = byFile[file]!
+    const shown = entries.slice(0, GREP_MAX_MATCHES_PER_FILE)
+    body.push(`--- ${file} (${entries.length} match${entries.length === 1 ? '' : 'es'}) ---`)
+    for (const entry of shown) {
+      body.push(truncateLine(entry.line))
+    }
+    const extra = entries.length - shown.length
+    if (extra > 0) {
+      body.push(`${file}: +${extra} more match${extra === 1 ? '' : 'es'}`)
+    }
+  }
+
+  if (dropped.length > 0) {
+    const droppedMatches = dropped.reduce(
+      (n, f) => n + (byFile[f]?.length ?? 0),
+      0,
+    )
+    body.push(
+      `<omitted>: ${dropped.length} file${dropped.length === 1 ? '' : 's'}, ${droppedMatches} match${droppedMatches === 1 ? '' : 'es'} not shown`,
+    )
+  }
+
+  if (other.length > 0) {
+    body.push('--- other (preserved literally) ---')
+    for (const line of other) body.push(truncateLine(line))
+  }
+
+  return { body: body.join('\n'), strategy: 'grep-grouped' }
+}
+
+// ============================================================
+// Strategy 3: WebFetch
+// ============================================================
+
+const WEBFETCH_HEAD_LINES = 100
+const WEBFETCH_TAIL_LINES = 40
+const WEBFETCH_TITLE_LINES = 3
+
+function summarizeWebFetchOutput(text: string): StrategyResult {
+  // Detect HTML residual density: > 1 HTML marker per 2KB.
+  const htmlMarkers =
+    (text.match(/<script[\s>]/gi)?.length ?? 0) +
+    (text.match(/<style[\s>]/gi)?.length ?? 0) +
+    (text.match(/<!DOCTYPE/gi)?.length ?? 0)
+  const htmlDense = htmlMarkers > Math.max(1, Math.floor(text.length / 2048))
+
+  let working = text
+  let strategy: StrategyName = 'webfetch-head-tail'
+
+  if (htmlDense) {
+    // Strip script/style blocks (non-greedy, multiline).
+    working = working
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+    strategy = 'webfetch-stripped'
+  }
+
+  const lines = working.split('\n')
+
+  // Detect title in first few lines.
+  let titleLine = -1
+  const scanUpTo = Math.min(WEBFETCH_TITLE_LINES, lines.length)
+  for (let i = 0; i < scanUpTo; i++) {
+    const l = lines[i] ?? ''
+    if (l.startsWith('# ') || /^Title:\s*/i.test(l)) {
+      titleLine = i
+      break
+    }
+  }
+
+  const total = lines.length
+  const keep = new Array<boolean>(total).fill(false)
+
+  if (titleLine >= 0) keep[titleLine] = true
+
+  const headEnd = Math.min(WEBFETCH_HEAD_LINES, total)
+  const tailStart = Math.max(headEnd, total - WEBFETCH_TAIL_LINES)
+  for (let i = 0; i < headEnd; i++) keep[i] = true
+  for (let i = tailStart; i < total; i++) keep[i] = true
+
+  const parts: string[] = []
+  let i = 0
+  while (i < total) {
+    if (keep[i]) {
+      parts.push(truncateLine(lines[i] ?? ''))
+      i++
+      continue
+    }
+    let j = i
+    let skippedChars = 0
+    while (j < total && !keep[j]) {
+      skippedChars += (lines[j] ?? '').length + 1
+      j++
+    }
+    parts.push(
+      `[…webfetch content omitted: ${j - i} lines, ${formatFileSize(skippedChars)}…]`,
+    )
+    i = j
+  }
+
+  return { body: parts.join('\n'), strategy }
+}
