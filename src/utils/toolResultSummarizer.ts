@@ -227,14 +227,32 @@ const BASH_ERROR_BEFORE = 5
 const BASH_ERROR_AFTER = 10
 const BASH_MAX_LINE_WIDTH = 500
 
-// Matches common error signatures on any line. `Error`/`Exception` are kept
-// unanchored so they catch compound names like `ValueError`, `TypeError`,
-// `RuntimeException`. `Traceback (...)` is literal — the closing paren + colon
-// means a trailing `\b` wouldn't fire. `fatal:` / `panic:` / `FAIL`/`FAILED`
-// match git/Go/CI output. The `Exit code:` alternative anchors to the full
-// line via `^...$` with the /m flag.
-const BASH_ERROR_REGEX =
-  /(Error|Exception|Traceback \(most recent call last\):|panic:|fatal:|undefined reference to)|\bFAIL(?:ED)?\b|^Exit code: [1-9]\d*$/m
+// Two-pass error detection. Split into two regexes so case-sensitive anchors
+// (line-anchored `Exit code:`, all-caps `FAIL`/`FATAL` log markers that we
+// don't want matching common words like "email"/"email failure") stay rigid
+// while the primary error tokens are case-insensitive.
+//
+// Strict pass — case-sensitive, anchor-bearing:
+// - `^Exit code: N$` requires the /m flag and a non-zero numeric code.
+// - `\bFAIL(?:ED)?\b` stays uppercase-only to avoid matching "fail" inside
+//   compound English (it's rare to see standalone "FAIL" outside CI logs).
+// - `\bFATAL\b` (no colon) catches log4j-style level markers (`[FATAL]`,
+//   `FATAL com.foo.Bar - oops`) which routinely appear without a colon.
+const BASH_ERROR_REGEX_STRICT =
+  /^Exit code: [1-9]\d*$|\bFAIL(?:ED)?\b|\bFATAL\b/m
+
+// Loose pass — case-insensitive, with deliberate FP-reduction shape.
+// - `\b(?:error|exception|fatal|panic)(?:\[[^\]]+\])?:` requires `:` directly
+//   after the token (or after an optional `[CODE]` block, e.g. Rust's
+//   `error[E0308]:`). This drops "Graceful Exception handler installed" and
+//   "no errors found" while keeping `gcc error:`, `cargo build` errors, and
+//   server `ERROR:` log lines.
+// - `Traceback \(most recent call last\):` is the canonical Python prefix.
+// - `panicked at` covers Rust runtime panics
+//   (`thread 'main' panicked at 'msg'`).
+// - `undefined reference to` covers linker errors.
+const BASH_ERROR_REGEX_LOOSE =
+  /\b(?:error|exception|fatal|panic)(?:\[[^\]]+\])?:|Traceback \(most recent call last\):|panicked at|undefined reference to/i
 
 function summarizeBashOutput(text: string): StrategyResult | null {
   // JSON passthrough — never mutate structured data.
@@ -381,7 +399,10 @@ function collapseDigitTemplates(lines: string[]): string[] {
 function findErrorIndices(lines: string[]): number[] {
   const out: number[] = []
   for (let i = 0; i < lines.length; i++) {
-    if (BASH_ERROR_REGEX.test(lines[i] ?? '')) out.push(i)
+    const line = lines[i] ?? ''
+    if (BASH_ERROR_REGEX_STRICT.test(line) || BASH_ERROR_REGEX_LOOSE.test(line)) {
+      out.push(i)
+    }
   }
   // Keep only first and last to bound error-window explosion.
   if (out.length <= 2) return out

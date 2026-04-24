@@ -275,6 +275,131 @@ test('bash: digit-template dedupe (N updates)', () => {
   expect(body).toMatch(/processing file \d+ of many items \(\d+ updates\)/)
 })
 
+test('bash: cargo error[E0308] in middle preserved (case-insensitive `error:` + bracketed code)', () => {
+  // Simulate ~150 lines of cargo "Compiling …" progress, an error block in
+  // the middle, then more progress. Vary the line shape so digit-template
+  // dedupe does NOT collapse it (we want the error to land outside head/tail).
+  const crates = ['serde', 'tokio', 'anyhow', 'reqwest', 'clap', 'tracing']
+  const pad = ' '.repeat(40)
+  const head = Array.from(
+    { length: 120 },
+    (_, i) =>
+      `   Compiling ${crates[i % crates.length]}-${i} v${i}.${i + 1}.${i + 2}${pad}feature=${i}`,
+  )
+  const errorBlock = [
+    'error[E0308]: mismatched types',
+    '   --> src/main.rs:42:9',
+    '    |',
+    '42  |     let x: u32 = "hello";',
+    '    |            ---   ^^^^^^^ expected `u32`, found `&str`',
+    '    |            |',
+    '    |            expected due to this',
+  ]
+  const tail = Array.from(
+    { length: 120 },
+    (_, i) =>
+      `   Compiling ${crates[i % crates.length]}-tail-${i} v${i}.${i + 1}${pad}feature=${i}`,
+  )
+  const content = [...head, ...errorBlock, ...tail].join('\n')
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('error[E0308]: mismatched types')
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.errorWindowPreserved).toBe(true)
+})
+
+test('bash: Rust runtime panic preserved (`panicked at`)', () => {
+  const pad = ' filler ' + 'x'.repeat(40)
+  const head = Array.from({ length: 80 }, (_, i) => `info line ${i}${pad}`)
+  const panicLine = `thread 'main' panicked at 'assertion failed: x == y', src/lib.rs:17:5`
+  const tail = Array.from({ length: 80 }, (_, i) => `later ${i}${pad}`)
+  const content = [...head, panicLine, ...tail].join('\n')
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain("panicked at 'assertion failed: x == y'")
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.errorWindowPreserved).toBe(true)
+})
+
+test('bash: Java FATAL level marker preserved (no colon, mixed levels)', () => {
+  // Simulate log4j-style output: INFO/WARN noise around a single FATAL line.
+  const levels = ['INFO', 'WARN', 'INFO', 'INFO', 'WARN']
+  const head = Array.from(
+    { length: 100 },
+    (_, i) => `2026-04-24 12:34:${String(i).padStart(2, '0')} ${levels[i % levels.length]} com.foo.Bar - normal noise ${i}`,
+  )
+  const fatalLine =
+    '2026-04-24 12:35:00 FATAL com.foo.Bar - JVM heap exhausted, terminating'
+  const tail = Array.from(
+    { length: 100 },
+    (_, i) => `2026-04-24 12:36:${String(i).padStart(2, '0')} INFO com.foo.Baz - shutting down ${i}`,
+  )
+  const content = [...head, fatalLine, ...tail].join('\n')
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('FATAL com.foo.Bar - JVM heap exhausted')
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.errorWindowPreserved).toBe(true)
+})
+
+test('bash: nginx-style ERROR (uppercase) preserved among 200-response noise', () => {
+  // 500 access-log-ish lines + one ERROR upstream line buried in the middle.
+  const head = Array.from(
+    { length: 250 },
+    (_, i) =>
+      `127.0.0.1 - - [24/Apr/2026:12:00:${String(i % 60).padStart(2, '0')}] "GET /api/${i} HTTP/1.1" 200 ${1024 + i}`,
+  )
+  const errLine = `2026/04/24 12:00:30 [error] 1234#1234: ERROR: upstream timed out (connecting to backend)`
+  const tail = Array.from(
+    { length: 250 },
+    (_, i) =>
+      `127.0.0.1 - - [24/Apr/2026:12:01:${String(i % 60).padStart(2, '0')}] "GET /api/late/${i} HTTP/1.1" 200 ${2048 + i}`,
+  )
+  const content = [...head, errLine, ...tail].join('\n')
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const body = asString(out)
+  expect(body).toContain('ERROR: upstream timed out')
+
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt?.metadata.errorWindowPreserved).toBe(true)
+})
+
+test('bash: negative — `error`/`errors` without colon does NOT trigger window (FP guard)', () => {
+  // 300 distinct lines all containing `error`/`errors` but never `error:`.
+  // Vary shape so digit-template dedupe doesn't collapse them and they
+  // genuinely fall outside head (40) + tail (60).
+  const phrases = [
+    'no errors found in the build',
+    'errors reported: 0',
+    'previous errors have been resolved',
+    'audit: errors detected last week',
+    'the errors module exports helpers',
+  ]
+  const lines = Array.from(
+    { length: 300 },
+    (_, i) => `${phrases[i % phrases.length]} (entry ${i} ${'x'.repeat(20)})`,
+  )
+  const content = lines.join('\n')
+  expect(content.length).toBeGreaterThan(8_000)
+
+  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
+  expect(evt).toBeDefined()
+  // Critical: NO error window should fire on these innocuous strings.
+  expect(evt?.metadata.errorWindowPreserved).toBe(false)
+})
+
 test('bash: head+tail without error emits omitted marker', () => {
   // Vary shape per line so digit-template dedupe does NOT collapse the input —
   // we want to exercise head+tail omission of mid-stream lines.
