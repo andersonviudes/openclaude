@@ -163,11 +163,8 @@ test('wire-level savings: ≥90% reduction when dedup strips static context', as
  * request body builders, and all 11+ providers share one of them.
  *   - OpenAI Chat Completions engine (openaiShim) — covered above.
  *   - OpenAI Responses API engine (codexShim) — covered here.
- *   - Anthropic native engine (@anthropic-ai/sdk direct) — covered
- *     upstream by the pipeline-level test (appendSystemContext strips
- *     keys before the body builder runs, so the engine just gets
- *     less input). We don't mock @anthropic-ai/sdk at the wire level
- *     because the Anthropic win is cache stability, not byte count.
+ *   - Anthropic native engine (@anthropic-ai/sdk direct) — covered in
+ *     the last block below via fetch interception on the SDK itself.
  *
  * This block exercises codexShim's body builder directly via
  * `convertAnthropicMessagesToResponsesInput` + `stableStringify` to
@@ -214,6 +211,97 @@ describe('static-dedup engine coverage: OpenAI Responses API (codex)', () => {
     // eslint-disable-next-line no-console
     console.log(
       `[static-dedup wire openai-responses] bytes: baseline=${baselineBytes} dedup=${dedupBytes} savings=${(savings * 100).toFixed(1)}%`,
+    )
+  })
+})
+
+/**
+ * Anthropic native engine (@anthropic-ai/sdk). Confirms that Sonnet /
+ * Opus / Haiku users also see the byte reduction — the SDK runs fetch
+ * internally, so we can intercept it the same way we do for the
+ * OpenAI shim. Unlike the shims, the Anthropic SDK builds its own
+ * body and doesn't go through `stableStringify`; the savings come
+ * entirely from `filterStaticDedupKeys` stripping the big keys
+ * upstream (see `appendSystemContext` / `prependUserContext`).
+ *
+ * So this test answers the question: "does flipping the flag make
+ * measurable difference when I run Claude Sonnet on 1P Anthropic?".
+ * Yes — and by how many bytes.
+ */
+describe('static-dedup engine coverage: Anthropic native SDK', () => {
+  const ORIGINAL_ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
+
+  beforeAll(() => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test-key'
+  })
+
+  afterAll(() => {
+    if (ORIGINAL_ANTHROPIC_API_KEY === undefined) {
+      delete process.env.ANTHROPIC_API_KEY
+    } else {
+      process.env.ANTHROPIC_API_KEY = ORIGINAL_ANTHROPIC_API_KEY
+    }
+  })
+
+  function makeAnthropicResponse(): Response {
+    return new Response(
+      JSON.stringify({
+        id: 'msg_1',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-sonnet-4-6',
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: {
+          input_tokens: 10,
+          output_tokens: 2,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+      }),
+      { headers: { 'Content-Type': 'application/json' } },
+    )
+  }
+
+  async function captureAnthropicBody(systemPrompt: string): Promise<number> {
+    let capturedLength = 0
+    globalThis.fetch = (async (_input, init) => {
+      capturedLength = String(init?.body ?? '').length
+      return makeAnthropicResponse()
+    }) as FetchType
+
+    // Dynamic import so the mocked fetch is picked up for this call.
+    const { default: Anthropic } = await import('@anthropic-ai/sdk')
+    const client = new Anthropic({ apiKey: 'sk-ant-test-key' })
+    await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 16,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: 'hello' }],
+    })
+    return capturedLength
+  }
+
+  test('anthropic wire: baseline request body carries the full static context', async () => {
+    const bytes = await captureAnthropicBody(baselineSystemPrompt)
+    expect(bytes).toBeGreaterThan(LARGE_CLAUDE_MD.length)
+  })
+
+  test('anthropic wire: dedup-shaped body is dramatically smaller', async () => {
+    const bytes = await captureAnthropicBody(dedupSystemPrompt)
+    expect(bytes).toBeLessThan(500)
+  })
+
+  test('anthropic engine savings: ≥90% reduction when dedup strips static context', async () => {
+    const baselineBytes = await captureAnthropicBody(baselineSystemPrompt)
+    const dedupBytes = await captureAnthropicBody(dedupSystemPrompt)
+    const savings = (baselineBytes - dedupBytes) / baselineBytes
+
+    expect(savings).toBeGreaterThanOrEqual(0.9)
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[static-dedup wire anthropic-native] bytes: baseline=${baselineBytes} dedup=${dedupBytes} savings=${(savings * 100).toFixed(1)}%`,
     )
   })
 })
