@@ -393,7 +393,7 @@ test('bash: negative — `error`/`errors` without colon does NOT trigger window 
   const content = lines.join('\n')
   expect(content.length).toBeGreaterThan(8_000)
 
-  const out = maybeSummarizeToolResult(makeBlock(content), 'Bash')
+  maybeSummarizeToolResult(makeBlock(content), 'Bash')
   const evt = loggedEvents.find(e => e.name === 'openclaude_tool_result_summarized')
   expect(evt).toBeDefined()
   // Critical: NO error window should fire on these innocuous strings.
