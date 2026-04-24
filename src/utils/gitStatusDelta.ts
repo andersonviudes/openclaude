@@ -68,7 +68,7 @@ export function getGitStatusDelta(
   // immutable by design (see getGitStatus in src/context.ts).
   if (priorAttachmentCount > 0) return null
 
-  logEvent('tengu_git_status_delta', {
+  logEvent('openclaude_git_status_delta', {
     emitted: true,
     contentLength: currentGitStatus.length,
   })

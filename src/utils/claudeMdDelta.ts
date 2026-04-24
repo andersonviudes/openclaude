@@ -110,7 +110,7 @@ export function getClaudeMdDelta(
   // Unchanged from last announcement — copy elision.
   if (lastAnnouncedHash === currentHash) return null
 
-  logEvent('tengu_claude_md_delta', {
+  logEvent('openclaude_claude_md_delta', {
     changed: true,
     priorAnnounced: lastAnnouncedHash !== null,
     currentLength: normalized.length,
