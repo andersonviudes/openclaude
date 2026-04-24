@@ -19,8 +19,10 @@
  * the delta scanners regress, the wire byte counts stop moving and
  * the test fails.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { convertAnthropicMessagesToResponsesInput } from './codexShim.js'
 import { createOpenAIShimClient } from './openaiShim.js'
+import { stableStringify } from '../../utils/stableStringify.js'
 
 type FetchType = typeof globalThis.fetch
 const originalFetch = globalThis.fetch
@@ -152,6 +154,66 @@ test('wire-level savings: ≥90% reduction when dedup strips static context', as
   // Print the measured number so the PR description can quote it.
   // eslint-disable-next-line no-console
   console.log(
-    `[static-dedup wire] bytes: baseline=${baselineBytes} dedup=${dedupBytes} savings=${(savings * 100).toFixed(1)}%`,
+    `[static-dedup wire openai-chat] bytes: baseline=${baselineBytes} dedup=${dedupBytes} savings=${(savings * 100).toFixed(1)}%`,
   )
+})
+
+/**
+ * Coverage by ENGINE, not by provider: OpenClaude has 3 distinct
+ * request body builders, and all 11+ providers share one of them.
+ *   - OpenAI Chat Completions engine (openaiShim) — covered above.
+ *   - OpenAI Responses API engine (codexShim) — covered here.
+ *   - Anthropic native engine (@anthropic-ai/sdk direct) — covered
+ *     upstream by the pipeline-level test (appendSystemContext strips
+ *     keys before the body builder runs, so the engine just gets
+ *     less input). We don't mock @anthropic-ai/sdk at the wire level
+ *     because the Anthropic win is cache stability, not byte count.
+ *
+ * This block exercises codexShim's body builder directly via
+ * `convertAnthropicMessagesToResponsesInput` + `stableStringify` to
+ * confirm the Responses API path also shrinks proportionally when the
+ * static-dedup pipeline upstream has stripped the big keys.
+ */
+describe('static-dedup engine coverage: OpenAI Responses API (codex)', () => {
+  function buildBody(systemPrompt: string): string {
+    const anthropicMessages = [
+      {
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: 'hello' }],
+      },
+    ]
+    // The Responses API body shape that codexShim emits: instructions
+    // (system) + input (converted messages). stableStringify is the
+    // same serializer the shim uses before `fetch(..., { body })`.
+    const body = {
+      model: 'gpt-5-codex',
+      instructions: systemPrompt,
+      input: convertAnthropicMessagesToResponsesInput(anthropicMessages),
+      stream: false,
+    }
+    return stableStringify(body)
+  }
+
+  test('baseline Responses body carries the full static context', () => {
+    const body = buildBody(baselineSystemPrompt)
+    expect(body.length).toBeGreaterThan(LARGE_CLAUDE_MD.length)
+  })
+
+  test('dedup-shaped Responses body is dramatically smaller', () => {
+    const body = buildBody(dedupSystemPrompt)
+    expect(body.length).toBeLessThan(500)
+  })
+
+  test('codex engine savings: ≥90% reduction mirrors the chat engine', () => {
+    const baselineBytes = buildBody(baselineSystemPrompt).length
+    const dedupBytes = buildBody(dedupSystemPrompt).length
+    const savings = (baselineBytes - dedupBytes) / baselineBytes
+
+    expect(savings).toBeGreaterThanOrEqual(0.9)
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[static-dedup wire openai-responses] bytes: baseline=${baselineBytes} dedup=${dedupBytes} savings=${(savings * 100).toFixed(1)}%`,
+    )
+  })
 })
