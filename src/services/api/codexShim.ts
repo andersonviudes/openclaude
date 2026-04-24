@@ -903,18 +903,14 @@ export async function* codexStreamToAnthropic(
       stop_reason: determineStopReason(finalResponse, sawToolUse),
       stop_sequence: null,
     },
-    usage: {
-      // Subtract cached tokens: OpenAI includes them in input_tokens,
-      // but Anthropic convention treats input_tokens as non-cached only.
-      input_tokens: (finalResponse?.usage?.input_tokens ?? 0) -
-        (finalResponse?.usage?.input_tokens_details?.cached_tokens ??
-         finalResponse?.usage?.prompt_tokens_details?.cached_tokens ?? 0),
-      output_tokens: finalResponse?.usage?.output_tokens ?? 0,
-      cache_read_input_tokens:
-        finalResponse?.usage?.input_tokens_details?.cached_tokens ??
-        finalResponse?.usage?.prompt_tokens_details?.cached_tokens ??
-        0,
-    },
+    // Delegate to the shared normalizer so the streaming message_delta
+    // path uses the same raw→Anthropic conversion as makeUsage() above
+    // and the non-streaming response converter below. Previously this
+    // block had its own inline subtraction that missed Kimi / DeepSeek
+    // / Gemini raw shapes that the shared helper handles.
+    usage: makeUsage(
+      finalResponse?.usage as Record<string, unknown> | undefined,
+    ),
   }
   yield { type: 'message_stop' }
 }
