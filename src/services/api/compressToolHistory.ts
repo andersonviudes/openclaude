@@ -206,6 +206,28 @@ function shouldCompressBlock(
   return isCompactableTool(toolUse.name)
 }
 
+function buildOldTierToolUseIds(
+  messages: AnyMessage[],
+  positionByIndex: Map<number, number>,
+  tiers: Tiers,
+  total: number,
+  toolUsesById: Map<string, ToolUseBlock>,
+): Set<string> {
+  const ids = new Set<string>()
+  for (const [msgIdx, pos] of positionByIndex) {
+    const fromEnd = total - 1 - pos
+    if (fromEnd < tiers.recent + tiers.mid) continue
+    const content = getInner(messages[msgIdx]).content
+    if (!Array.isArray(content)) continue
+    for (const block of content as ToolResultBlock[]) {
+      if (block?.type !== 'tool_result' || !block.tool_use_id) continue
+      if (!shouldCompressBlock(block, toolUsesById)) continue
+      ids.add(block.tool_use_id)
+    }
+  }
+  return ids
+}
+
 export function compressToolHistory<T extends AnyMessage>(
   messages: T[],
   model: string,
@@ -231,7 +253,7 @@ export function compressToolHistory<T extends AnyMessage>(
 
   const toolUsesById = indexToolUses(messages)
 
-  return messages.map((msg, i) => {
+  const firstPass = messages.map((msg, i) => {
     const pos = positionByIndex.get(i)
     if (pos === undefined) return msg
 
@@ -251,5 +273,24 @@ export function compressToolHistory<T extends AnyMessage>(
     })
 
     return rewriteMessage(msg, newContent)
+  })
+
+  const oldTierIds = buildOldTierToolUseIds(messages, positionByIndex, tiers, total, toolUsesById)
+  if (oldTierIds.size === 0) return firstPass
+
+  return firstPass.map(msg => {
+    const inner = getInner(msg)
+    const role = inner.role ?? (msg as { role?: string }).role
+    if (role !== 'assistant') return msg
+    const content = inner.content
+    if (!Array.isArray(content)) return msg
+    let changed = false
+    const newContent = (content as ToolUseBlock[]).map(block => {
+      if (block?.type !== 'tool_use' || !block.id || !oldTierIds.has(block.id)) return block
+      changed = true
+      const charCount = JSON.stringify(block.input ?? {}).length
+      return { ...block, input: { _stub: `input: ${charCount} chars omitted` } }
+    })
+    return changed ? rewriteMessage(msg, newContent) : msg
   })
 }

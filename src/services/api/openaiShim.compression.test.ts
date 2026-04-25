@@ -285,13 +285,21 @@ test('FIX: every tool_call retains its full id, name, and arguments', async () =
     function: { name: string; arguments: string }
   }>
 
+  // 100k → recent=5, mid=10. 30 exchanges → indices 0..14 old, 15..24 mid, 25..29 recent.
+  // All 30 tool_calls must be present, have the right id/name, and valid JSON arguments.
   expect(toolCalls.length).toBe(30)
   for (let i = 0; i < toolCalls.length; i++) {
     expect(toolCalls[i].id).toBe(`toolu_${i}`)
     expect(toolCalls[i].function.name).toBe('Read')
-    expect(JSON.parse(toolCalls[i].function.arguments)).toEqual({
-      file_path: `/path/to/file${i}.ts`,
-    })
+    // arguments must always be valid JSON (the regression was a bare string)
+    const parsed = JSON.parse(toolCalls[i].function.arguments)
+    if (i <= 14) {
+      // old tier: input stubbed to { _stub: "input: N chars omitted" }
+      expect(parsed).toMatchObject({ _stub: expect.stringContaining('chars omitted') })
+    } else {
+      // mid + recent tier: original input preserved
+      expect(parsed).toEqual({ file_path: `/path/to/file${i}.ts` })
+    }
   }
 })
 

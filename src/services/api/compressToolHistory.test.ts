@@ -542,6 +542,206 @@ test('blocks already cleared by microCompact are NOT re-compressed', () => {
   expect(getResultText(resultMsgs[0])).toBe('[Old tool result content cleared]')
 })
 
+// ---------- tool_use.input compression ----------
+
+function getUseBlocks(msg: Msg): Block[] {
+  if (!Array.isArray(msg.content)) return []
+  return (msg.content as Block[]).filter((b: any) => b.type === 'tool_use')
+}
+
+function getUseMessages(messages: Msg[]): Msg[] {
+  return messages.filter(
+    m => Array.isArray(m.content) && m.content.some((b: any) => b.type === 'tool_use'),
+  )
+}
+
+test('old-tier tool_use.input is stubbed with char count', () => {
+  // 100k → recent=5, mid=10. 20 exchanges → 5 old.
+  const messages = buildConversation(20, 5_000)
+  const result = compressToolHistory(messages, 'gpt-4o')
+  const useMsgs = getUseMessages(result as Msg[])
+
+  // First 5 are old tier — their inputs should be stubbed
+  for (let i = 0; i < 5; i++) {
+    const useBlock = getUseBlocks(useMsgs[i])[0]
+    expect(typeof useBlock.input).toBe('object')
+    expect(useBlock.input).toMatchObject({ _stub: expect.stringContaining('chars omitted') })
+  }
+})
+
+test('recent and mid tier tool_use.input preserved', () => {
+  // 100k → recent=5, mid=10. 20 exchanges → 5 old + 10 mid + 5 recent.
+  const messages = buildConversation(20, 5_000)
+  const result = compressToolHistory(messages, 'gpt-4o')
+  const useMsgs = getUseMessages(result as Msg[])
+
+  // Last 15 (10 mid + 5 recent) must still have original object input
+  for (let i = 5; i < 20; i++) {
+    const useBlock = getUseBlocks(useMsgs[i])[0]
+    expect(typeof useBlock.input).toBe('object')
+    expect((useBlock.input as any).file_path).toMatch(/^\/path\/to\/file\d+\.ts$/)
+  }
+})
+
+test('non-compactable tool_use (Agent) input never stubbed even in old tier', () => {
+  const messages: Msg[] = [
+    { role: 'user', content: 'start' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'agent_1', name: 'Agent', input: { task: 'do something' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'agent_1', content: bigText(5_000) },
+      ],
+    },
+    ...buildConversation(20, 100).slice(1),
+  ]
+  const result = compressToolHistory(messages, 'gpt-4o')
+  const useMsg = (result as Msg[])[1]
+  const useBlock = getUseBlocks(useMsg)[0]
+
+  expect(typeof useBlock.input).toBe('object')
+  expect((useBlock.input as any).task).toBe('do something')
+})
+
+test('disabled toggle: no tool_use.input changed', () => {
+  mockState.enabled = false
+  const messages = buildConversation(20, 5_000)
+  const result = compressToolHistory(messages, 'gpt-4o')
+
+  // Should be same reference — no transformation at all
+  expect(result).toBe(messages)
+  const useMsgs = getUseMessages(result as Msg[])
+  for (const msg of useMsgs) {
+    for (const block of getUseBlocks(msg)) {
+      expect(typeof block.input).toBe('object')
+    }
+  }
+})
+
+test('parallel tool calls: only old-tier inputs stubbed, recent untouched', () => {
+  // 100k → recent=5, mid=10. We need 16 exchanges total so position 0 is old-tier.
+  // Assistant turn at message index 1 has 3 tool_use blocks: toolu_A, toolu_B, toolu_C.
+  // toolu_A and toolu_B will be pushed into old-tier by additional padding.
+  // toolu_C will be part of the recent-tier exchanges.
+  const messages: Msg[] = [
+    { role: 'user', content: 'start' },
+    // First assistant turn with 3 parallel tool calls
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'toolu_A', name: 'Read', input: { file_path: '/a.ts' } },
+        { type: 'tool_use', id: 'toolu_B', name: 'Read', input: { file_path: '/b.ts' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_A', content: bigText(5_000) },
+        { type: 'tool_result', tool_use_id: 'toolu_B', content: bigText(5_000) },
+      ],
+    },
+    // Pad 14 more compactable exchanges to push above into old tier
+    ...buildConversation(14, 100).slice(1),
+    // One recent-tier exchange using toolu_C
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'toolu_C', name: 'Read', input: { file_path: '/c.ts' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'toolu_C', content: bigText(5_000) },
+      ],
+    },
+  ]
+  const result = compressToolHistory(messages, 'gpt-4o')
+
+  // Find the assistant message with toolu_A and toolu_B
+  const firstAssistant = (result as Msg[])[1]
+  const blocks = getUseBlocks(firstAssistant)
+  const blockA = blocks.find((b: any) => b.id === 'toolu_A')!
+  const blockB = blocks.find((b: any) => b.id === 'toolu_B')!
+
+  expect(typeof blockA.input).toBe('object')
+  expect(blockA.input).toMatchObject({ _stub: expect.stringContaining('chars omitted') })
+  expect(typeof blockB.input).toBe('object')
+  expect(blockB.input).toMatchObject({ _stub: expect.stringContaining('chars omitted') })
+
+  // Find the assistant message with toolu_C (recent tier)
+  const lastAssistant = (result as Msg[]).slice().reverse().find(
+    (m: Msg) => Array.isArray(m.content) && (m.content as Block[]).some((b: any) => b.id === 'toolu_C'),
+  )!
+  const blockC = getUseBlocks(lastAssistant).find((b: any) => b.id === 'toolu_C')!
+
+  expect(typeof blockC.input).toBe('object')
+  expect((blockC.input as any).file_path).toBe('/c.ts')
+})
+
+test('wrapped assistant message: tool_use.input stubbed via message.content (not content)', () => {
+  type WrappedMsg = { message: { role: string; content: Block[] | string } }
+  const wrap = (m: { role: string; content: Block[] | string }): WrappedMsg => ({
+    message: { role: m.role, content: m.content },
+  })
+  // 100k → recent=5, mid=10. 20 wrapped exchanges → 5 old-tier.
+  const messages = buildConversation(20, 5_000).map(wrap)
+  const result = compressToolHistory(messages as any, 'gpt-4o')
+
+  // Find the first wrapped assistant message (position 0 is old-tier)
+  const firstAssistant = (result as WrappedMsg[]).find(
+    m =>
+      Array.isArray(m.message.content) &&
+      m.message.content.some((b: any) => b.type === 'tool_use'),
+  )!
+
+  // Stub must be written into message.content, not a top-level content key
+  expect((firstAssistant as any).content).toBeUndefined()
+  const useBlock = (firstAssistant.message.content as Block[]).find(
+    (b: any) => b.type === 'tool_use',
+  ) as Block
+  expect(typeof useBlock.input).toBe('object')
+  expect(useBlock.input).toMatchObject({ _stub: expect.stringContaining('chars omitted') })
+})
+
+test('orphan tool_use (no matching tool_result) input left untouched even in old-tier position', () => {
+  // Build a conversation where the very first assistant message has a tool_use
+  // with no corresponding tool_result anywhere. Pad with 20 normal exchanges to
+  // push it deep into old-tier position, but buildOldTierToolUseIds only adds
+  // ids that appear in old-tier tool_result messages, so the orphan id is never
+  // added to the set.
+  const orphanInput = { file_path: '/orphan.ts' }
+  const messages: Msg[] = [
+    { role: 'user', content: 'start' },
+    {
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_orphan',
+          name: 'Read',
+          input: orphanInput,
+        },
+      ],
+    },
+    // No user message with tool_result for toolu_orphan here — it is orphaned.
+    ...buildConversation(20, 5_000).slice(1),
+  ]
+  const result = compressToolHistory(messages, 'gpt-4o')
+
+  const orphanAssistant = (result as Msg[])[1]
+  const useBlock = getUseBlocks(orphanAssistant)[0]
+
+  expect(typeof useBlock.input).toBe('object')
+  expect((useBlock.input as any).file_path).toBe('/orphan.ts')
+  expect((useBlock.input as any)._stub).toBeUndefined()
+})
+
 test('extra block attributes (e.g. cache_control) preserved across rewrites', () => {
   const cacheControl = { type: 'ephemeral' }
   const messages: Msg[] = [
