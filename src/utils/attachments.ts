@@ -26,6 +26,11 @@ import { TODO_WRITE_TOOL_NAME } from '../tools/TodoWriteTool/constants.js'
 import { TASK_CREATE_TOOL_NAME } from '../tools/TaskCreateTool/constants.js'
 import { TASK_UPDATE_TOOL_NAME } from '../tools/TaskUpdateTool/constants.js'
 import { BASH_TOOL_NAME } from '../tools/BashTool/toolName.js'
+import {
+  getBashGitInstructionsBody,
+  shouldInjectBashGitInstructionsInMessages,
+} from '../tools/BashTool/prompt.js'
+import { shouldIncludeGitInstructions } from './gitSettings.js'
 import { SKILL_TOOL_NAME } from '../tools/SkillTool/constants.js'
 import type { TodoList } from './todo/types.js'
 import {
@@ -536,6 +541,10 @@ export type Attachment =
       isInitial: boolean
     }
   | {
+      type: 'bash_git_instructions'
+      content: string
+    }
+  | {
       type: 'skill_discovery'
       skills: { name: string; description: string; shortId?: string }[]
       signal: DiscoverySignal
@@ -874,6 +883,9 @@ export async function getAttachments(
     // relevant_memories moved to async prefetch (startRelevantMemoryPrefetch)
     maybe('dynamic_skill', () => getDynamicSkillAttachments(context)),
     maybe('skill_listing', () => getSkillListingAttachments(context)),
+    maybe('bash_git_instructions', () =>
+      getBashGitInstructionsAttachment(context),
+    ),
     // Inter-turn skill discovery now runs via startSkillDiscoveryPrefetch
     // (query.ts, concurrent with the main turn). The blocking call that
     // previously lived here was the assistant_turn signal — 97% of those
@@ -2747,6 +2759,103 @@ async function getSkillListingAttachments(
       content,
       skillCount: newSkills.length,
       isInitial,
+    },
+  ]
+}
+
+// Agents that have already received the bash_git_instructions attachment in
+// this process. Keyed by agentId (empty string = main thread) for parity with
+// sentSkillNames — without per-agent scoping a subagent inheriting the main
+// thread's emission state would never receive its own copy.
+//
+// The body is a single binary blob: either the full git/PR protocol or
+// nothing. There's no delta to track, so a Set of agentIds is enough — once
+// emitted, never re-emit. Re-emitting on every agentic-loop iteration would
+// add ~3.5KB of fresh user content per turn, dwarfing the ~6.4KB the move
+// saved from the tool schema after only two iterations.
+const sentBashGitInstructions = new Set<string>()
+let suppressNextBashGitInstructionsFlag = false
+
+/**
+ * Reset emission state. With no argument, clears every agent's slot AND the
+ * resume suppress latch — used by /clear which wipes the whole conversation.
+ *
+ * With an explicit `agentKey`, deletes only that slot. Used by
+ * runPostCompactCleanup so a subagent's compact can't accidentally wipe the
+ * main thread's "already sent" mark and force re-injection there. The
+ * suppress latch is process-global and not touched in the targeted case —
+ * compact never overlaps with resume.
+ *
+ * Pass `''` to target the main thread (matches the agentKey convention used
+ * by getBashGitInstructionsAttachment).
+ */
+export function resetSentBashGitInstructions(agentKey?: string): void {
+  if (agentKey !== undefined) {
+    sentBashGitInstructions.delete(agentKey)
+    return
+  }
+  sentBashGitInstructions.clear()
+  suppressNextBashGitInstructionsFlag = false
+}
+
+/**
+ * Suppress the next bash_git_instructions injection. Called by
+ * conversationRecovery when an attachment of this type is already in the
+ * resumed transcript so we don't re-emit ~3.5KB the model can already see.
+ *
+ * `sentBashGitInstructions` is module-scope — process-local. Each `claude -p`
+ * spawn starts with an empty Set, so without this every --resume re-injects
+ * the full block. Fire-once latch; consumed on the first emission attempt.
+ */
+export function suppressNextBashGitInstructions(): void {
+  suppressNextBashGitInstructionsFlag = true
+}
+
+export async function getBashGitInstructionsAttachment(
+  toolUseContext: ToolUseContext,
+): Promise<Attachment[]> {
+  if (process.env.NODE_ENV === 'test') {
+    return []
+  }
+
+  if (!shouldInjectBashGitInstructionsInMessages()) {
+    return []
+  }
+
+  // Skip git instructions for agents without the Bash tool — they can't run
+  // git or gh commands, so the protocol is dead weight.
+  if (
+    !toolUseContext.options.tools.some(t => toolMatchesName(t, BASH_TOOL_NAME))
+  ) {
+    return []
+  }
+
+  // Mirror the gate the inline path used to apply in getCommitAndPRInstructions.
+  if (!shouldIncludeGitInstructions()) {
+    return []
+  }
+
+  const agentKey = toolUseContext.agentId ?? ''
+
+  // Resume path: prior process already injected the block; it's in the
+  // transcript. Mark the current agent as sent so we don't double-inject,
+  // then bail. Latch is one-shot — the next agent that calls this still
+  // gets the regular emission.
+  if (suppressNextBashGitInstructionsFlag) {
+    suppressNextBashGitInstructionsFlag = false
+    sentBashGitInstructions.add(agentKey)
+    return []
+  }
+
+  if (sentBashGitInstructions.has(agentKey)) {
+    return []
+  }
+  sentBashGitInstructions.add(agentKey)
+
+  return [
+    {
+      type: 'bash_git_instructions',
+      content: getBashGitInstructionsBody(),
     },
   ]
 }

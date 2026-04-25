@@ -3,6 +3,7 @@ import type { QuerySource } from '../../constants/querySource.js'
 import { clearSystemPromptSections } from '../../constants/systemPromptSections.js'
 import { getUserContext } from '../../context.js'
 import { clearSpeculativeChecks } from '../../tools/BashTool/bashPermissions.js'
+import { resetSentBashGitInstructions } from '../../utils/attachments.js'
 import { clearClassifierApprovals } from '../../utils/classifierApprovals.js'
 import { resetGetMemoryFilesCache } from '../../utils/claudemd.js'
 import { clearSessionMessagesCache } from '../../utils/sessionStorage.js'
@@ -67,6 +68,23 @@ export function runPostCompactCleanup(querySource?: QuerySource): void {
   // model still has SkillTool in schema, invoked_skills preserves used
   // skills, and dynamic additions are handled by skillChangeDetector /
   // cacheUtils resets. See compactConversation() for full rationale.
+  //
+  // Bash git/PR instructions DO need a reset: stripReinjectedAttachments
+  // removes them from the summarizer input (compact.ts), and unlike
+  // skill_listing there's no fallback path — the body lives only in this
+  // attachment. Without resetting, the compacted conversation loses the
+  // protocol entirely on the next git turn.
+  //
+  // Reset is gated and per-agent: only the main-thread slot ('') is cleared
+  // when the main thread compacts, so a subagent compact can't wipe the
+  // main thread's already-sent mark and force a 3.5KB re-injection there.
+  // Subagent compact does NOT clear its own slot — accepting that the
+  // subagent loses access to the protocol post-compact in exchange for
+  // never corrupting main-thread state. Subagents that need git protocol
+  // post-compact are rare; main-thread cache stability is not.
+  if (isMainThreadCompact) {
+    resetSentBashGitInstructions('')
+  }
   clearBetaTracingState()
   if (feature('COMMIT_ATTRIBUTION')) {
     void import('../../utils/attributionHooks.js').then(m =>

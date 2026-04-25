@@ -18,7 +18,10 @@ import type {
   NormalizedUserMessage,
 } from '../types/message.js'
 import { PERMISSION_MODES } from '../types/permissions.js'
-import { suppressNextSkillListing } from './attachments.js'
+import {
+  suppressNextBashGitInstructions,
+  suppressNextSkillListing,
+} from './attachments.js'
 import {
   copyFileHistoryForResume,
   type FileHistorySnapshot,
@@ -459,6 +462,13 @@ export function restoreSkillStateFromMessages(messages: Message[]): void {
     // ~600 tokens. Fire-once latch; consumed on the first attachment pass.
     if (message.attachment.type === 'skill_listing') {
       suppressNextSkillListing()
+    }
+    // Same rationale for the bash git/PR protocol attachment: prior process
+    // injected ~3.5KB worth of body and it's already in the transcript.
+    // Without this latch, every --resume re-injects, breaking prompt-cache
+    // stability for daemons / repeat-launch scripts.
+    if (message.attachment.type === 'bash_git_instructions') {
+      suppressNextBashGitInstructions()
     }
   }
 }

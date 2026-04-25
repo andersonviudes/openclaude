@@ -76,6 +76,10 @@ export function clearSessionCaches(
   // runPostCompactCleanup intentionally does NOT reset this (post-compact
   // re-injection costs ~4K tokens), but /clear wipes messages entirely so
   // the model needs the full listing again.
+  // bash_git_instructions reset is handled inside runPostCompactCleanup
+  // above (gated to main-thread compacts). On --resume the reset runs
+  // before restoreSkillStateFromMessages arms the suppress latch, so the
+  // latch survives the wipe — no double-injection on resume.
   resetSentSkillNames()
   // Override the memory cache reset with 'session_start': clearSessionCaches is called
   // from /clear and --resume/--continue, which are NOT compaction events. Without this,

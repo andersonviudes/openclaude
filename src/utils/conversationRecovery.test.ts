@@ -6,7 +6,14 @@ import { join } from 'node:path'
 import {
   loadConversationForResume,
   ResumeTranscriptTooLargeError,
+  restoreSkillStateFromMessages,
 } from './conversationRecovery.ts'
+import {
+  getBashGitInstructionsAttachment,
+  resetSentBashGitInstructions,
+} from './attachments.js'
+import type { ToolUseContext } from '../Tool.js'
+import { BASH_TOOL_NAME } from '../tools/BashTool/toolName.js'
 
 const tempDirs: string[] = []
 const originalSimple = process.env.CLAUDE_CODE_SIMPLE
@@ -76,4 +83,45 @@ test('loadConversationForResume rejects oversized reconstructed transcripts', as
   expect((caught as Error).message).toContain(
     'Reconstructed transcript is too large to resume safely',
   )
+})
+
+test('restoreSkillStateFromMessages arms the bash_git_instructions suppress latch', async () => {
+  // Clean slate — process-local state from earlier tests would falsely
+  // satisfy the assertion via the per-agent dedup path.
+  resetSentBashGitInstructions()
+
+  // Pin env so getBashGitInstructionsAttachment exercises the real branches
+  // (NODE_ENV=test would early-return).
+  const originalNodeEnv = process.env.NODE_ENV
+  const originalDisable = process.env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS
+  process.env.NODE_ENV = 'production'
+  process.env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = 'false'
+
+  const messagesWithBash = [
+    {
+      type: 'attachment',
+      attachment: { type: 'bash_git_instructions', content: 'git protocol body' },
+    },
+  ] as unknown as Parameters<typeof restoreSkillStateFromMessages>[0]
+
+  restoreSkillStateFromMessages(messagesWithBash)
+
+  // Latch should now be armed: the next emission attempt returns []
+  // even though we haven't sent before.
+  const ctx = {
+    options: { tools: [{ name: BASH_TOOL_NAME }] },
+  } as unknown as ToolUseContext
+  const result = await getBashGitInstructionsAttachment(ctx)
+
+  // Restore env before any assertion that could throw mid-test.
+  if (originalNodeEnv === undefined) delete process.env.NODE_ENV
+  else process.env.NODE_ENV = originalNodeEnv
+  if (originalDisable === undefined) delete process.env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS
+  else process.env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = originalDisable
+
+  expect(result).toEqual([])
+
+  // After the latch consumes the suppression, a fresh agent still gets the
+  // body (one-shot semantics) — but we already verified that contract in
+  // attachments.test.ts; here we only care that the latch armed.
 })

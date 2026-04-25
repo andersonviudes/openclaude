@@ -3748,6 +3748,17 @@ Read the team config to discover your teammates' names. Check the task list peri
         }),
       ])
     }
+    case 'bash_git_instructions': {
+      if (!attachment.content) {
+        return []
+      }
+      return wrapMessagesInSystemReminder([
+        createUserMessage({
+          content: attachment.content,
+          isMeta: true,
+        }),
+      ])
+    }
     case 'queued_command': {
       // Prefer explicit origin carried from the queue; fall back to commandMode
       // for task notifications (which predate origin).

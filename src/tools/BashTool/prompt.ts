@@ -2,7 +2,7 @@ import { feature } from 'bun:bundle'
 import { prependBullets } from '../../constants/prompts.js'
 import { getAttributionTexts } from '../../utils/attribution.js'
 import { hasEmbeddedSearchTools } from '../../utils/embeddedTools.js'
-import { isEnvTruthy } from '../../utils/envUtils.js'
+import { isEnvDefinedFalsy, isEnvTruthy } from '../../utils/envUtils.js'
 import { shouldIncludeGitInstructions } from '../../utils/gitSettings.js'
 import { getClaudeTempDir } from '../../utils/permissions/filesystem.js'
 import { SandboxManager } from '../../utils/sandbox/sandbox-adapter.js'
@@ -39,19 +39,41 @@ function getBackgroundUsageNote(): string | null {
   return "You can use the `run_in_background` parameter to run the command in the background. Only use this if you don't need the result immediately and are OK being notified when the command completes later. You do not need to check the output right away - you'll be notified when it finishes. You do not need to use '&' at the end of the command when using this parameter."
 }
 
-function getCommitAndPRInstructions(): string {
-  // Defense-in-depth: undercover instructions must survive even if the user
-  // has disabled git instructions entirely. Attribution stripping and model-ID
-  // hiding are mechanical and work regardless, but the explicit "don't blow
-  // your cover" instructions are the last line of defense against the model
-  // volunteering an internal codename in a commit message.
-  const undercoverSection =
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? getUndercoverInstructions() + '\n'
-      : ''
+/**
+ * Whether the bash git/PR instructions block should be injected as an
+ * attachment message instead of embedded in the BashTool description. When
+ * true, getCommitAndPRInstructions() returns only the undercover section
+ * (defense-in-depth) and attachments.ts emits a bash_git_instructions
+ * attachment per request.
+ *
+ * The git block is ~7.5KB combined (ant short + external full). Lifting it
+ * out of the tool description keeps the tool-schema cache stable when only
+ * the git block changes (toggle, cwd switch in/out of repo).
+ *
+ * Override with CLAUDE_CODE_BASH_GIT_IN_MESSAGES=false to revert to the
+ * inline behavior. Default = true (attachment on).
+ *
+ * Note: the upstream `tengu_bash_git_attach` GrowthBook gate is intentionally
+ * skipped here because OpenClaude's getFeatureValue_CACHED_MAY_BE_STALE is a
+ * stub that always returns the default — adding a gate would be cargo-cult
+ * without the GrowthBook server. Env var is the only toggle.
+ */
+export function shouldInjectBashGitInstructionsInMessages(): boolean {
+  if (isEnvDefinedFalsy(process.env.CLAUDE_CODE_BASH_GIT_IN_MESSAGES))
+    return false
+  return true
+}
 
-  if (!shouldIncludeGitInstructions()) return undercoverSection
-
+/**
+ * The bash git/PR instructions body, without the undercover section and
+ * without the `shouldIncludeGitInstructions()` gate. Callers must check
+ * `shouldIncludeGitInstructions()` themselves before deciding to emit this
+ * (the attachment builder does — see attachments.ts).
+ *
+ * Returns the ant-short variant when USER_TYPE=ant, else the external full
+ * git+PR protocol.
+ */
+export function getBashGitInstructionsBody(): string {
   // For ant users, use the short version pointing to skills
   if (process.env.USER_TYPE === 'ant') {
     const skillsSection = !isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)
@@ -65,7 +87,7 @@ Before creating a pull request, run \`/simplify\` to review your changes, then t
 
 `
       : ''
-    return `${undercoverSection}# Git operations
+    return `# Git operations
 
 ${skillsSection}IMPORTANT: NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it.
 
@@ -158,6 +180,27 @@ Important:
 
 # Other common operations
 - View comments on a Github PR: gh api repos/foo/bar/pulls/123/comments`
+}
+
+function getCommitAndPRInstructions(): string {
+  // Defense-in-depth: undercover instructions must survive even if the user
+  // has disabled git instructions entirely. Attribution stripping and model-ID
+  // hiding are mechanical and work regardless, but the explicit "don't blow
+  // your cover" instructions are the last line of defense against the model
+  // volunteering an internal codename in a commit message. Stays inline even
+  // when the rest of the git block is moved to a system-reminder attachment.
+  const undercoverSection =
+    process.env.USER_TYPE === 'ant' && isUndercover()
+      ? getUndercoverInstructions() + '\n'
+      : ''
+
+  if (!shouldIncludeGitInstructions()) return undercoverSection
+
+  // When the git block is delivered via attachment, only the undercover
+  // section stays in the description.
+  if (shouldInjectBashGitInstructionsInMessages()) return undercoverSection
+
+  return `${undercoverSection}${getBashGitInstructionsBody()}`
 }
 
 // SandboxManager merges config from multiple sources (settings layers, defaults,

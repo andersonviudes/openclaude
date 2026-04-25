@@ -208,12 +208,25 @@ export function stripImagesFromMessages(messages: Message[]): Message[] {
  * + the next turn's discovery signal, so feeding them to the summarizer
  * wastes tokens and pollutes the summary with stale skill suggestions.
  *
- * No-op when EXPERIMENTAL_SKILL_SEARCH is off (the attachment types
- * don't exist on external builds).
+ * bash_git_instructions follows the same pattern: re-emitted fresh on the
+ * next turn after resetSentBashGitInstructions() runs in
+ * runPostCompactCleanup. Always-on (no feature gate) since the attachment
+ * type exists in every build.
+ *
+ * `feature()` from `bun:bundle` requires direct use in an if/ternary so
+ * the bundler can DCE the branch — that's why this function double-filters
+ * instead of composing the predicates.
  */
 export function stripReinjectedAttachments(messages: Message[]): Message[] {
+  let result = messages.filter(
+    m =>
+      !(
+        m.type === 'attachment' &&
+        m.attachment.type === 'bash_git_instructions'
+      ),
+  )
   if (feature('EXPERIMENTAL_SKILL_SEARCH')) {
-    return messages.filter(
+    result = result.filter(
       m =>
         !(
           m.type === 'attachment' &&
@@ -222,7 +235,7 @@ export function stripReinjectedAttachments(messages: Message[]): Message[] {
         ),
     )
   }
-  return messages
+  return result
 }
 
 export const ERROR_MESSAGE_NOT_ENOUGH_MESSAGES =

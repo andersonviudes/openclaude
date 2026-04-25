@@ -769,7 +769,7 @@ function normalizeSchemaForOpenAI(
   return record
 }
 
-function convertTools(
+export function convertTools(
   tools: Array<{ name: string; description?: string; input_schema?: Record<string, unknown> }>,
 ): OpenAITool[] {
   const isGemini = isGeminiMode()
