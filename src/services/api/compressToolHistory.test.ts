@@ -540,6 +540,10 @@ test('blocks already cleared by microCompact are NOT re-compressed', () => {
 
   // Already-cleared marker survives untouched (no double processing)
   expect(getResultText(resultMsgs[0])).toBe('[Old tool result content cleared]')
+
+  // Corresponding tool_use.input also left alone — not stubbed
+  const clearedUseBlock = (result[1].content as Block[]).find((b: any) => b.type === 'tool_use')
+  expect((clearedUseBlock?.input as any)?._stub).toBeUndefined()
 })
 
 // ---------- tool_use.input compression ----------
@@ -625,9 +629,9 @@ test('disabled toggle: no tool_use.input changed', () => {
 
 test('parallel tool calls: only old-tier inputs stubbed, recent untouched', () => {
   // 100k → recent=5, mid=10. We need 16 exchanges total so position 0 is old-tier.
-  // Assistant turn at message index 1 has 3 tool_use blocks: toolu_A, toolu_B, toolu_C.
-  // toolu_A and toolu_B will be pushed into old-tier by additional padding.
-  // toolu_C will be part of the recent-tier exchanges.
+  // First assistant turn has 2 parallel tool_use blocks: toolu_A, toolu_B.
+  // Padding pushes them into old-tier. toolu_C is in a separate later exchange
+  // that lands in recent-tier — only toolu_A and toolu_B should be stubbed.
   const messages: Msg[] = [
     { role: 'user', content: 'start' },
     // First assistant turn with 3 parallel tool calls
