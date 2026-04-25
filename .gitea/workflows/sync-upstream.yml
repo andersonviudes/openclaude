@@ -45,3 +45,49 @@ jobs:
           fi
 
           git push origin main --follow-tags
+
+      - name: Rebase personal onto main
+        env:
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Reuse the clone from the previous step.
+          cd repo
+
+          # rerere lets known conflict resolutions auto-replay between runs.
+          # The clone is fresh each run, so the cache builds up only within a
+          # single rebase; cross-run persistence would need a Gitea Actions
+          # cache artifact — left as a follow-up.
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+
+          # Pull the current state of `personal` from origin.
+          git fetch origin personal || {
+            echo "origin/personal not found — nothing to rebase."
+            exit 0
+          }
+
+          git checkout -B personal origin/personal
+
+          OLD=$(git rev-parse HEAD)
+
+          # `commit.gpgsign=false` because gpg-agent has no TTY in CI and
+          # would block pinentry. Rebased commits land unsigned — acceptable
+          # for the sync bot; signed commits should originate from devs.
+          if git -c commit.gpgsign=false rebase origin/main; then
+            NEW=$(git rev-parse HEAD)
+            if [ "$OLD" = "$NEW" ]; then
+              echo "personal already up to date with main."
+              exit 0
+            fi
+            git push --force-with-lease origin personal
+            echo "personal rebased: ${OLD:0:7} -> ${NEW:0:7}"
+          else
+            CONFLICTS=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            git rebase --abort
+            # Soft-fail: main sync already succeeded above; don't redo the
+            # whole job. Surface as a workflow warning instead.
+            echo "::warning::personal rebase onto main failed; unresolved conflicts in: ${CONFLICTS:-<unknown>}"
+            exit 0
+          fi
