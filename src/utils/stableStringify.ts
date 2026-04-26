@@ -40,16 +40,31 @@
  * - Undefined values are dropped (matching `JSON.stringify`).
  * - Indentation matches the `space` argument (0 by default → compact).
  *
- * Single-pass: `deepSort` walks the value tree once, building a sorted
- * clone. A `WeakSet` of ancestors tracks the current path through the
- * object graph so that circular references throw `TypeError` (same
- * contract as native `JSON.stringify`). Ancestors are always removed in
- * a `finally` block when unwinding out of each object branch (even on
+ * Native `JSON.stringify` pre-processing is preserved before sorting:
+ *   - `toJSON(key)` is invoked on objects that define it (own or
+ *     inherited — covers `Date`, `URL`, and any user class). The `key`
+ *     argument is the property name for nested object values, the array
+ *     index as a string for array elements, and `''` for the top-level
+ *     call, matching native semantics.
+ *   - Boxed primitive wrappers (`new Number(...)`, `new String(...)`,
+ *     `new Boolean(...)`) are unboxed to their primitive form.
+ * Both happen BEFORE the array/object branches dispatch, so the value
+ * actually walked is the post-conversion form. If `toJSON` returns
+ * `undefined`, the value is dropped from its parent (matching native
+ * `JSON.stringify`).
+ *
+ * Single-pass: `deepSort` walks the (possibly converted) value tree
+ * once, building a sorted clone. A `WeakSet` of ancestors tracks the
+ * current path through the object graph so that circular references
+ * throw `TypeError` (same contract as native `JSON.stringify`). The
+ * cycle check runs on the post-`toJSON` value, so a `toJSON` impl that
+ * returns an ancestor still throws. Ancestors are always removed in a
+ * `finally` block when unwinding out of each object branch (even on
  * exception), so DAG inputs — where the same object is reachable via
  * multiple keys — are handled correctly and do not throw.
  */
 export function stableStringify(value: unknown, space?: number): string {
-  return JSON.stringify(deepSort(value), null, space)
+  return JSON.stringify(deepSort(value, new WeakSet(), ''), null, space)
 }
 
 /**
@@ -57,24 +72,57 @@ export function stableStringify(value: unknown, space?: number): string {
  * at every depth, arrays preserved. Useful when callers need to feed
  * the sorted shape into a downstream serializer (e.g., when they must
  * call `JSON.stringify` with a custom spacing or replacer).
+ *
+ * Applies the same `toJSON(key)` invocation and primitive-wrapper
+ * unboxing as `stableStringify`, so the returned shape mirrors what
+ * native `JSON.stringify` would have walked.
  */
 export function sortKeysDeep<T>(value: T): T {
-  return deepSort(value) as T
+  return deepSort(value, new WeakSet(), '') as T
 }
 
-function deepSort(value: unknown, ancestors = new WeakSet()): unknown {
+function deepSort(
+  value: unknown,
+  ancestors: WeakSet<object>,
+  key: string,
+): unknown {
+  // Step 1: invoke toJSON(key) if present — matches native pre-processing.
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    typeof (value as { toJSON?: unknown }).toJSON === 'function'
+  ) {
+    value = (value as { toJSON: (k: string) => unknown }).toJSON(key)
+  }
+
+  // Step 2: unbox primitive wrappers.
+  if (value instanceof Number) value = Number(value)
+  else if (value instanceof String) value = String(value)
+  else if (value instanceof Boolean) value = Boolean(value.valueOf())
+
+  // Step 3: primitives short-circuit (post-toJSON the value may now be one).
   if (value === null || typeof value !== 'object') return value
-  if (Array.isArray(value)) return value.map(v => deepSort(v, ancestors))
+
+  // Step 4: arrays — element key is the index as a string.
+  if (Array.isArray(value)) {
+    return value.map((v, i) => deepSort(v, ancestors, String(i)))
+  }
+
+  // Step 5: cycle check on the post-toJSON value.
   if (ancestors.has(value as object)) {
     throw new TypeError('Converting circular structure to JSON')
   }
   ancestors.add(value as object)
   try {
     const sorted: Record<string, unknown> = {}
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      const v = (value as Record<string, unknown>)[key]
-      if (v === undefined) continue
-      sorted[key] = deepSort(v, ancestors)
+    for (const k of Object.keys(value as Record<string, unknown>).sort()) {
+      const child = deepSort(
+        (value as Record<string, unknown>)[k],
+        ancestors,
+        k,
+      )
+      if (child === undefined) continue
+      sorted[k] = child
     }
     return sorted
   } finally {
